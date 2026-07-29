@@ -112,3 +112,12 @@ This version enforces owner-only editing and deletion in both the UI and Supabas
 - Only the owner sees Edit, Clear, Save, Manage, and Delete controls.
 - My Brackets is filtered by `owner_id`.
 - Tournament, contestant, and matchup writes require ownership of the parent bracket.
+
+
+## Mobile experience overhaul
+
+- Rebuilt mobile header and navigation spacing.
+- Replaced overlapping horizontal action rows with responsive button grids.
+- Improved Builder, Explore, Manage Bracket, Admin, and live canvas layouts.
+- Enlarged touch targets and made mobile controls wrap cleanly down to 320px.
+- Preserved one-finger panning and two-finger pinch zoom on the bracket canvas.

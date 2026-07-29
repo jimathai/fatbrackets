@@ -1342,6 +1342,15 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   });
   const momentumFrameRef = useRef<number | null>(null);
   const panRef = useRef({ x: 0, y: 0 });
+  const scaleRef = useRef(settings.defaultZoom);
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef({
+    active: false,
+    startDistance: 0,
+    startScale: settings.defaultZoom,
+    worldX: 0,
+    worldY: 0,
+  });
   const [scale, setScale] = useState(settings.defaultZoom);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedRegion, setSelectedRegion] = useState("full");
@@ -1367,6 +1376,11 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   const updatePan = useCallback((nextPan: { x: number; y: number }) => {
     panRef.current = nextPan;
     setPan(nextPan);
+  }, []);
+
+  const updateScale = useCallback((nextScale: number) => {
+    scaleRef.current = nextScale;
+    setScale(nextScale);
   }, []);
 
   const stopMomentum = useCallback(() => {
@@ -1439,13 +1453,13 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     if (!viewport) return;
     const padding = 12;
     const nextScale = Math.min(settings.maximumZoom, Math.max(settings.minimumZoom, Math.min((viewport.clientWidth - padding) / canvasWidth, (viewport.clientHeight - padding) / canvasHeight)));
-    setScale(nextScale);
+    updateScale(nextScale);
     stopMomentum();
     updatePan({
       x: (viewport.clientWidth - canvasWidth * nextScale) / 2,
       y: (viewport.clientHeight - canvasHeight * nextScale) / 2,
     });
-  }, [canvasHeight, canvasWidth, settings.maximumZoom, settings.minimumZoom, stopMomentum, updatePan]);
+  }, [canvasHeight, canvasWidth, settings.maximumZoom, settings.minimumZoom, stopMomentum, updatePan, updateScale]);
 
   const fitBounds = useCallback((bounds: { minX: number; minY: number; maxX: number; maxY: number }) => {
     const viewport = viewportRef.current;
@@ -1454,13 +1468,13 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     const width = bounds.maxX - bounds.minX;
     const height = bounds.maxY - bounds.minY;
     const nextScale = Math.min(settings.maximumZoom, Math.max(settings.minimumZoom, Math.min((viewport.clientWidth - padding * 2) / width, (viewport.clientHeight - padding * 2) / height)));
-    setScale(nextScale);
+    updateScale(nextScale);
     stopMomentum();
     updatePan({
       x: (viewport.clientWidth - width * nextScale) / 2 - bounds.minX * nextScale,
       y: (viewport.clientHeight - height * nextScale) / 2 - bounds.minY * nextScale,
     });
-  }, [settings.maximumZoom, settings.minimumZoom, stopMomentum, updatePan]);
+  }, [settings.maximumZoom, settings.minimumZoom, stopMomentum, updatePan, updateScale]);
 
   const getRegionBounds = useCallback((regionIndex: number) => {
     const side = regionIndex < regionsPerSide ? "left" : "right";
@@ -1517,6 +1531,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   }, [fitCanvas]);
 
   useEffect(() => () => stopMomentum(), [stopMomentum]);
+  useEffect(() => { scaleRef.current = scale; }, [scale]);
 
   function zoomBy(amount: number, originX?: number, originY?: number) {
     const viewport = viewportRef.current;
@@ -1530,7 +1545,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     const worldX = (localX - pan.x) / scale;
     const worldY = (localY - pan.y) / scale;
     stopMomentum();
-    setScale(nextScale);
+    updateScale(nextScale);
     updatePan({ x: localX - worldX * nextScale, y: localY - worldY * nextScale });
   }
 
@@ -1558,16 +1573,51 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
 
     const nextScale = Math.min(settings.maximumZoom, Math.max(Math.max(settings.minimumZoom, 0.9), scale < 0.85 ? 1 : scale + 0.22));
     stopMomentum();
-    setScale(nextScale);
+    updateScale(nextScale);
     updatePan({
       x: viewport.clientWidth / 2 - worldX * nextScale,
       y: viewport.clientHeight / 2 - worldY * nextScale,
     });
   }
 
+  function pointerPair() {
+    return Array.from(pointersRef.current.entries()).slice(0, 2);
+  }
+
+  function beginPinch() {
+    const viewport = viewportRef.current;
+    const pair = pointerPair();
+    if (!viewport || pair.length < 2) return;
+    const [, first] = pair[0];
+    const [, second] = pair[1];
+    const rect = viewport.getBoundingClientRect();
+    const midpointX = (first.x + second.x) / 2 - rect.left;
+    const midpointY = (first.y + second.y) / 2 - rect.top;
+    const currentScale = scaleRef.current;
+    pinchRef.current = {
+      active: true,
+      startDistance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
+      startScale: currentScale,
+      worldX: (midpointX - panRef.current.x) / currentScale,
+      worldY: (midpointY - panRef.current.y) / currentScale,
+    };
+    dragRef.current.active = false;
+    stopMomentum();
+    viewport.classList.add("dragging");
+  }
+
   function onPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     if ((event.target as HTMLElement).closest("button, select, input, textarea, .viewportControls")) return;
+    event.preventDefault();
     stopMomentum();
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    if (pointersRef.current.size >= 2) {
+      beginPinch();
+      return;
+    }
+
     const now = performance.now();
     dragRef.current = {
       active: true,
@@ -1582,11 +1632,36 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
       velocityX: 0,
       velocityY: 0,
     };
-    event.currentTarget.setPointerCapture(event.pointerId);
     event.currentTarget.classList.add("dragging");
   }
 
   function onPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pinchRef.current.active && pointersRef.current.size >= 2) {
+      event.preventDefault();
+      const viewport = viewportRef.current;
+      const pair = pointerPair();
+      if (!viewport || pair.length < 2) return;
+      const [, first] = pair[0];
+      const [, second] = pair[1];
+      const rect = viewport.getBoundingClientRect();
+      const midpointX = (first.x + second.x) / 2 - rect.left;
+      const midpointY = (first.y + second.y) / 2 - rect.top;
+      const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
+      const nextScale = Math.min(
+        settings.maximumZoom,
+        Math.max(settings.minimumZoom, pinchRef.current.startScale * (distance / pinchRef.current.startDistance)),
+      );
+      updateScale(nextScale);
+      updatePan({
+        x: midpointX - pinchRef.current.worldX * nextScale,
+        y: midpointY - pinchRef.current.worldY * nextScale,
+      });
+      return;
+    }
+
     const drag = dragRef.current;
     if (!drag.active || drag.pointerId !== event.pointerId) return;
     const now = performance.now();
@@ -1602,7 +1677,35 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   }
 
   function stopDragging(event: ReactPointerEvent<HTMLDivElement>) {
+    const wasPinching = pinchRef.current.active;
     const drag = dragRef.current;
+    pointersRef.current.delete(event.pointerId);
+
+    if (wasPinching) {
+      pinchRef.current.active = false;
+      drag.active = false;
+      if (pointersRef.current.size === 1) {
+        const [remainingId, remaining] = Array.from(pointersRef.current.entries())[0];
+        const now = performance.now();
+        dragRef.current = {
+          active: true,
+          pointerId: remainingId,
+          x: remaining.x,
+          y: remaining.y,
+          startX: panRef.current.x,
+          startY: panRef.current.y,
+          lastX: remaining.x,
+          lastY: remaining.y,
+          lastTime: now,
+          velocityX: 0,
+          velocityY: 0,
+        };
+      } else {
+        event.currentTarget.classList.remove("dragging");
+      }
+      return;
+    }
+
     if (!drag.active || drag.pointerId !== event.pointerId) return;
     drag.active = false;
     event.currentTarget.classList.remove("dragging");
@@ -1624,7 +1727,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     <div className="bracketHeading canvasHeading">
       <div className="canvasTitle">
         <h1>{name}</h1>
-        <p>Drag to move. Scroll to zoom. Double-click any area to focus it.</p>
+        <p>Drag to move. Scroll or pinch to zoom. Double-click any area to focus it.</p>
       </div>
       <div className="canvasActions">
         {editable ? <SaveLabel state={saveState} /> : <span className="readOnlyBadge">View only</span>}

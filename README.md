@@ -121,3 +121,10 @@ This version enforces owner-only editing and deletion in both the UI and Supabas
 - Improved Builder, Explore, Manage Bracket, Admin, and live canvas layouts.
 - Enlarged touch targets and made mobile controls wrap cleanly down to 320px.
 - Preserved one-finger panning and two-finger pinch zoom on the bracket canvas.
+
+## Mobile/Desktop point zoom update
+
+- Double-click with a mouse or double-tap on touchscreens to zoom in 25%.
+- Zoom is anchored at the cursor/finger position.
+- Zoom respects the Admin maximum zoom setting.
+- Dragging, momentum panning, pinch zoom, wheel zoom, and toolbar controls remain available.

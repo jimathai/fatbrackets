@@ -864,6 +864,12 @@ export default function Home() {
           onRandomizeAll={() => randomizeRange(1, size)}
           onRandomizeRegion={(regionIndex) => randomizeRange(regionIndex * 16 + 1, regionIndex * 16 + 16)}
           onUploadImage={uploadContestantImage}
+          onMergeImport={(entries) => {
+            setContestants((current) => mergeImportedEntries(current, entries));
+            setWinners({});
+            setSelectedSeed(null);
+            setSaveState("idle");
+          }}
           onDelete={() => tournamentId && deleteTournament(tournamentId)}
           clonedFromId={activeTournament?.cloned_from_id ?? null}
           clonedFromName={activeTournament?.cloned_from_name ?? null}
@@ -1200,13 +1206,145 @@ function Builder(props: {
   </>;
 }
 
+
+function parseManageDelimitedRows(raw: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index];
+    if (char === '"') {
+      if (quoted && raw[index + 1] === '"') { cell += '"'; index++; }
+      else quoted = !quoted;
+    } else if ((char === "," || char === "\t") && !quoted) {
+      row.push(cell.trim()); cell = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && raw[index + 1] === "\n") index++;
+      row.push(cell.trim()); cell = "";
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+    } else cell += char;
+  }
+  row.push(cell.trim());
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+function manageHeaderField(value: string): "name" | "seed" | "description" | "imageUrl" | null {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const aliases = {
+    name: ["name", "title", "team", "player", "contestant", "entry", "choice", "item", "dad", "character"],
+    seed: ["seed", "rank", "ranking", "order", "position", "number"],
+    description: ["description", "details", "detail", "subtitle", "summary", "bio", "notes", "show", "series"],
+    imageUrl: ["imageurl", "image", "photo", "photourl", "picture", "pictureurl", "cover", "coverurl", "art", "artwork", "url"],
+  } as const;
+  for (const [field, values] of Object.entries(aliases) as Array<[keyof typeof aliases, readonly string[]]>) {
+    if (values.some((alias) => normalized === alias || normalized.includes(alias) || alias.includes(normalized))) return field;
+  }
+  return null;
+}
+
+function parseManageImport(raw: string): ImportedEntry[] {
+  const rows = parseManageDelimitedRows(raw).filter((row) => row.some((cell) => cell.trim()));
+  if (!rows.length) return [];
+  const isUrl = (value: string) => /^https?:\/\//i.test(value.trim());
+  const isSeed = (value: string) => /^#?\d{1,3}$/.test(value.trim());
+  if (rows.length === 1 && rows[0].length > 1 && rows[0].every((cell) => !manageHeaderField(cell) && !isUrl(cell) && !isSeed(cell))) {
+    return rows[0].map((name) => ({ name: name.trim() })).filter((entry) => entry.name);
+  }
+  const maxColumns = Math.max(...rows.map((row) => row.length));
+  if (maxColumns === 1) return rows.map((row) => ({ name: row[0].trim().replace(/^\d+[.)-]?\s*/, "") })).filter((entry) => entry.name);
+  const firstFields = rows[0].map(manageHeaderField);
+  const hasHeader = firstFields.some(Boolean);
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+  const mapping: Partial<Record<"name" | "seed" | "description" | "imageUrl", number>> = {};
+  firstFields.forEach((field, index) => { if (field && mapping[field] === undefined) mapping[field] = index; });
+  if (!hasHeader) {
+    const columns = Array.from({ length: maxColumns }, (_, column) => dataRows.map((row) => (row[column] ?? "").trim()).filter(Boolean));
+    const imageColumn = columns.findIndex((values) => values.length && values.filter(isUrl).length / values.length >= 0.5);
+    const seedColumn = columns.findIndex((values, index) => index !== imageColumn && values.length && values.filter(isSeed).length / values.length >= 0.75);
+    if (imageColumn >= 0) mapping.imageUrl = imageColumn;
+    if (seedColumn >= 0) mapping.seed = seedColumn;
+    const available = columns.map((_, index) => index).filter((index) => index !== imageColumn && index !== seedColumn);
+    mapping.name = available[0] ?? 0;
+    if (available.length > 1) mapping.description = available[1];
+  }
+  if (mapping.name === undefined) mapping.name = Array.from({ length: maxColumns }, (_, index) => index).find((index) => index !== mapping.seed && index !== mapping.imageUrl && index !== mapping.description) ?? 0;
+  const seen = new Set<string>();
+  return dataRows.map((cells) => {
+    const name = (cells[mapping.name ?? 0] ?? "").trim().replace(/^\d+[.)-]?\s*/, "");
+    const seedText = mapping.seed === undefined ? "" : (cells[mapping.seed] ?? "");
+    const seed = Number.parseInt(seedText.replace(/[^0-9]/g, ""), 10);
+    return {
+      name,
+      seed: Number.isFinite(seed) ? seed : undefined,
+      description: mapping.description === undefined ? undefined : (cells[mapping.description] ?? "").trim() || undefined,
+      imageUrl: mapping.imageUrl === undefined ? undefined : (cells[mapping.imageUrl] ?? "").trim() || undefined,
+    };
+  }).filter((entry) => {
+    const key = entry.name.toLowerCase();
+    if (!entry.name || seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+
+function mergeImportedEntries(current: Contestant[], entries: ImportedEntry[]): Contestant[] {
+  const next = current.map((item) => ({ ...item }));
+  const usedSeeds = new Set<number>();
+  const overwriteQueue = next.map((item) => item.seed);
+  for (const entry of entries) {
+    let targetIndex = -1;
+    if (entry.seed && entry.seed >= 1 && entry.seed <= next.length) targetIndex = next.findIndex((item) => item.seed === entry.seed);
+    if (targetIndex < 0) targetIndex = next.findIndex((item) => item.name.trim().toLowerCase() === entry.name.trim().toLowerCase());
+    if (targetIndex < 0) targetIndex = next.findIndex((item) => !item.name.trim() && !usedSeeds.has(item.seed));
+    if (targetIndex < 0) {
+      const seed = overwriteQueue.find((candidate) => !usedSeeds.has(candidate));
+      targetIndex = seed ? next.findIndex((item) => item.seed === seed) : -1;
+    }
+    if (targetIndex < 0) continue;
+    const existing = next[targetIndex];
+    usedSeeds.add(existing.seed);
+    next[targetIndex] = {
+      ...existing,
+      name: entry.name || existing.name,
+      shortName: entry.name || existing.shortName,
+      details: entry.description !== undefined ? entry.description : existing.details,
+      imageUrl: entry.imageUrl !== undefined ? entry.imageUrl : existing.imageUrl,
+    };
+  }
+  return next;
+}
+
+function ManageImportPanel({ size, onImport }: { size: number; onImport: (entries: ImportedEntry[]) => void }) {
+  const [text, setText] = useState("");
+  const [message, setMessage] = useState("");
+  function apply(raw: string) {
+    const entries = parseManageImport(raw).slice(0, size);
+    if (!entries.length) return setMessage("No entries found. Name is required; all other fields are optional.");
+    onImport(entries);
+    setMessage(`${entries.length} entr${entries.length === 1 ? "y" : "ies"} merged. Existing names or specified seeds were updated first.`);
+  }
+  async function upload(file?: File) {
+    if (!file) return;
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    if (!extension || !["txt", "csv"].includes(extension)) return setMessage("Use a .txt or .csv file.");
+    apply(await file.text());
+  }
+  return <section className="manageImportPanel">
+    <div><b>Merge contestants</b><small>Upload or paste additions and corrections. Matching names and supplied seeds are updated first; new entries fill empty slots.</small></div>
+    <div className="manageImportActions"><input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={(event) => upload(event.target.files?.[0])} /><textarea placeholder="Paste names or comma-delimited rows…" value={text} onChange={(event) => setText(event.target.value)} /><button type="button" onClick={() => apply(text)}>Merge pasted list</button></div>
+    {message && <small className="importMessage">{message}</small>}
+  </section>;
+}
+
 function ManageBracket(props: {
   contestants: Contestant[]; name: string; saveState: SaveState; size: number; regionNames: string[]; playMode: PlayMode; tags: string[]; visibility: "private" | "public"; seedingStyle: SeedingStyle;
   selectedSeed: number | null; onBack: () => void; onOpenBracket: () => void; onSave: () => void;
   onName: (value: string) => void; onRegionNames: (names: string[]) => void; onPlayMode: (mode: PlayMode) => void; onTags: (tags: string[]) => void; onVisibility: (visibility: "private" | "public") => void; onSeedingStyle: (style: SeedingStyle) => void;
   onSelectSeed: (seed: number | null) => void; onUpdateContestant: (seed: number, patch: Partial<Contestant>) => void;
   onSwap: (fromSeed: number, toSeed: number) => void; onToggleLock: (seed: number) => void;
-  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, file: File) => void; onDelete: () => void;
+  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, file: File) => void; onMergeImport: (entries: ImportedEntry[]) => void; onDelete: () => void;
   clonedFromId: string | null; clonedFromName: string | null; onOpenOriginal: (id: string) => void;
 }) {
   const selected = props.contestants.find((item) => item.seed === props.selectedSeed);
@@ -1225,6 +1363,7 @@ function ManageBracket(props: {
       <TagSelector tags={props.tags} onChange={props.onTags} compact />
       <div className="visibilityChoice compact"><div><b>Visibility</b><small>Only public brackets appear in Explore.</small></div><div><button className={props.visibility === "private" ? "chosen" : ""} onClick={() => props.onVisibility("private")}>Private</button><button className={props.visibility === "public" ? "chosen" : ""} onClick={() => props.onVisibility("public")}>Public</button></div></div>
       <label>Play mode<select value={props.playMode} onChange={(event) => props.onPlayMode(event.target.value as PlayMode)}><option value="manual">Manual</option><option value="voting">Voting</option><option value="random">Random</option></select></label>
+      <ManageImportPanel size={props.size} onImport={props.onMergeImport} />
       {props.size >= 32 && <div className="seedingToggle" role="group" aria-label="Seeding style">
         <button className={props.seedingStyle === "overall" ? "active" : ""} onClick={() => props.onSeedingStyle("overall")}><b>Overall 1–{props.size}</b><small>Top seeds are balanced across regions.</small></button>
         <button className={props.seedingStyle === "regional" ? "active" : ""} onClick={() => props.onSeedingStyle("regional")}><b>Regional 1–16</b><small>Each region has its own #1 seed.</small></button>
@@ -1351,6 +1490,8 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     worldX: 0,
     worldY: 0,
   });
+  const tapRef = useRef({ lastTime: 0, x: 0, y: 0 });
+  const suppressDoubleClickUntilRef = useRef(0);
   const [scale, setScale] = useState(settings.defaultZoom);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedRegion, setSelectedRegion] = useState("full");
@@ -1549,34 +1690,22 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     updatePan({ x: localX - worldX * nextScale, y: localY - worldY * nextScale });
   }
 
-  function focusAtPoint(clientX: number, clientY: number) {
+  function zoomInAtPoint(clientX: number, clientY: number) {
     const viewport = viewportRef.current;
     if (!viewport) return;
     const rect = viewport.getBoundingClientRect();
-    const worldX = (clientX - rect.left - pan.x) / scale;
-    const worldY = (clientY - rect.top - pan.y) / scale;
-
-    if (regionCount > 0) {
-      for (let regionIndex = 0; regionIndex < regionCount; regionIndex++) {
-        const bounds = getRegionBounds(regionIndex);
-        if (bounds && worldX >= bounds.minX && worldX <= bounds.maxX && worldY >= bounds.minY && worldY <= bounds.maxY) {
-          fitRegion(regionIndex);
-          return;
-        }
-      }
-
-      if (worldX >= finalStageBounds.minX && worldX <= finalStageBounds.maxX && worldY >= finalStageBounds.minY && worldY <= finalStageBounds.maxY) {
-        fitFinalStage();
-        return;
-      }
-    }
-
-    const nextScale = Math.min(settings.maximumZoom, Math.max(Math.max(settings.minimumZoom, 0.9), scale < 0.85 ? 1 : scale + 0.22));
+    const localX = clientX - rect.left;
+    const localY = clientY - rect.top;
+    const currentScale = scaleRef.current;
+    const nextScale = Math.min(settings.maximumZoom, currentScale * 1.25);
+    if (nextScale <= currentScale) return;
+    const worldX = (localX - panRef.current.x) / currentScale;
+    const worldY = (localY - panRef.current.y) / currentScale;
     stopMomentum();
     updateScale(nextScale);
     updatePan({
-      x: viewport.clientWidth / 2 - worldX * nextScale,
-      y: viewport.clientHeight / 2 - worldY * nextScale,
+      x: localX - worldX * nextScale,
+      y: localY - worldY * nextScale,
     });
   }
 
@@ -1709,8 +1838,23 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     if (!drag.active || drag.pointerId !== event.pointerId) return;
     drag.active = false;
     event.currentTarget.classList.remove("dragging");
+
+    const movement = Math.hypot(event.clientX - drag.x, event.clientY - drag.y);
+    if (event.pointerType === "touch" && movement < 12) {
+      const now = performance.now();
+      const previousTap = tapRef.current;
+      const closeToPreviousTap = Math.hypot(event.clientX - previousTap.x, event.clientY - previousTap.y) < 32;
+      if (now - previousTap.lastTime < 350 && closeToPreviousTap) {
+        tapRef.current = { lastTime: 0, x: 0, y: 0 };
+        suppressDoubleClickUntilRef.current = Date.now() + 500;
+        zoomInAtPoint(event.clientX, event.clientY);
+        return;
+      }
+      tapRef.current = { lastTime: now, x: event.clientX, y: event.clientY };
+    }
+
     const idleFor = performance.now() - drag.lastTime;
-    if (idleFor < 90) startMomentum(drag.velocityX, drag.velocityY);
+    if (movement >= 12 && idleFor < 90) startMomentum(drag.velocityX, drag.velocityY);
   }
 
   function connectorPath(from: { x: number; y: number }, to: { x: number; y: number }, side: "left" | "right") {
@@ -1727,7 +1871,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     <div className="bracketHeading canvasHeading">
       <div className="canvasTitle">
         <h1>{name}</h1>
-        <p>Drag to move. Scroll or pinch to zoom. Double-click any area to focus it.</p>
+        <p>Drag to move. Scroll or pinch to zoom. Double-click or double-tap to zoom toward that point.</p>
       </div>
       <div className="canvasActions">
         {editable ? <SaveLabel state={saveState} /> : <span className="readOnlyBadge">View only</span>}
@@ -1756,8 +1900,9 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
       onPointerUp={stopDragging}
       onPointerCancel={stopDragging}
       onDoubleClick={(event) => {
+        if (Date.now() < suppressDoubleClickUntilRef.current) return;
         if ((event.target as HTMLElement).closest("button, select, .viewportControls")) return;
-        focusAtPoint(event.clientX, event.clientY);
+        zoomInAtPoint(event.clientX, event.clientY);
       }}
       onWheel={(event) => { event.preventDefault(); zoomBy(event.deltaY > 0 ? -0.07 : 0.07, event.clientX, event.clientY); }}
     >

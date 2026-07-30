@@ -1,0 +1,19 @@
+
+.manageImportPanel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line, #dbe3ee);
+  border-radius: 14px;
+  background: #f8fafc;
+}
+.manageImportPanel > div:first-child { display: grid; gap: 4px; }
+.manageImportPanel small { color: #64748b; }
+.manageImportActions { display: grid; grid-template-columns: minmax(190px, .7fr) minmax(260px, 1.5fr) auto; gap: 10px; align-items: stretch; }
+.manageImportActions input, .manageImportActions textarea, .manageImportActions button { min-height: 44px; }
+.manageImportActions textarea { resize: vertical; min-height: 76px; }
+@media (max-width: 760px) {
+  .manageImportActions { grid-template-columns: 1fr; }
+  .manageImportActions button, .manageImportActions input { width: 100%; }
+}

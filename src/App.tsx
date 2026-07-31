@@ -58,6 +58,7 @@ type AppSettings = {
   minimumZoom: number;
   maximumZoom: number;
   matchupHoverScale: number;
+  doubleTapZoomPercent: number;
 };
 
 const defaultAppSettings: AppSettings = {
@@ -67,6 +68,7 @@ const defaultAppSettings: AppSettings = {
   minimumZoom: 0.22,
   maximumZoom: 1.35,
   matchupHoverScale: 1.06,
+  doubleTapZoomPercent: 35,
 };
 
 function loadAppSettings(): AppSettings {
@@ -1354,21 +1356,40 @@ function ManageBracket(props: {
 
   return <div className="managePage">
     <div className="manageTopbar">
-      <div><button className="back" onClick={props.onBack}>← My Brackets</button><small>BRACKET ADMIN</small><input className="manageName" value={props.name} onChange={(event) => props.onName(event.target.value)} /></div>
-      <div className="manageTopActions"><SaveLabel state={props.saveState} /><button className="secondaryAction" onClick={props.onRandomizeAll}>↝ Randomize unlocked</button><button className="secondaryAction" onClick={props.onSave}>Save changes</button><button onClick={props.onOpenBracket}>Open bracket →</button></div>
+      <div><small>BRACKET ADMIN</small><input className="manageName" value={props.name} onChange={(event) => props.onName(event.target.value)} /></div>
+      <div className="manageTopActions"><SaveLabel state={props.saveState} /><button className="secondaryAction" onClick={props.onSave}>Save changes</button><button onClick={props.onOpenBracket}>Open bracket →</button></div>
     </div>
     {props.clonedFromId && <button className="manageCloneLineage" onClick={() => props.onOpenOriginal(props.clonedFromId as string)}>Cloned from {props.clonedFromName || "original bracket"} — view original ↗</button>}
 
-    <div className="manageSettings">
-      <TagSelector tags={props.tags} onChange={props.onTags} compact />
-      <div className="visibilityChoice compact"><div><b>Visibility</b><small>Only public brackets appear in Explore.</small></div><div><button className={props.visibility === "private" ? "chosen" : ""} onClick={() => props.onVisibility("private")}>Private</button><button className={props.visibility === "public" ? "chosen" : ""} onClick={() => props.onVisibility("public")}>Public</button></div></div>
-      <label>Play mode<select value={props.playMode} onChange={(event) => props.onPlayMode(event.target.value as PlayMode)}><option value="manual">Manual</option><option value="voting">Voting</option><option value="random">Random</option></select></label>
-      <ManageImportPanel size={props.size} onImport={props.onMergeImport} />
-      {props.size >= 32 && <div className="seedingToggle" role="group" aria-label="Seeding style">
-        <button className={props.seedingStyle === "overall" ? "active" : ""} onClick={() => props.onSeedingStyle("overall")}><b>Overall 1–{props.size}</b><small>Top seeds are balanced across regions.</small></button>
-        <button className={props.seedingStyle === "regional" ? "active" : ""} onClick={() => props.onSeedingStyle("regional")}><b>Regional 1–16</b><small>Each region has its own #1 seed.</small></button>
-      </div>}
-      <p>Drag cards to reseed or move contestants between regions. Lock favorites before randomizing.</p>
+    <div className="manageSettingsGrid">
+      <section className="manageSettingsCard manageIdentityCard">
+        <div className="manageSectionHeading"><span>01</span><div><b>Bracket settings</b><small>Control where this bracket appears and how it is played.</small></div></div>
+        <div className="manageFieldGrid">
+          <div className="manageTagsField"><TagSelector tags={props.tags} onChange={props.onTags} compact /></div>
+          <div className="visibilityChoice compact"><div><b>Visibility</b><small>Only public brackets appear in Explore.</small></div><div><button className={props.visibility === "private" ? "chosen" : ""} onClick={() => props.onVisibility("private")}>Private</button><button className={props.visibility === "public" ? "chosen" : ""} onClick={() => props.onVisibility("public")}>Public</button></div></div>
+          <label className="managePlayMode"><span>Play mode</span><select value={props.playMode} onChange={(event) => props.onPlayMode(event.target.value as PlayMode)}><option value="manual">Manual</option><option value="voting">Voting</option><option value="random">Random</option></select></label>
+        </div>
+      </section>
+
+      <section className="manageSettingsCard manageImportCard">
+        <div className="manageSectionHeading"><span>02</span><div><b>Update contestants</b><small>Merge a file or pasted list into the existing field.</small></div></div>
+        <ManageImportPanel size={props.size} onImport={props.onMergeImport} />
+      </section>
+
+    </div>
+
+    <div className="regionAdminToolbar">
+      <div><small>SEED YOUR FIELD</small><b>{regionCount === 1 ? "Contestants" : "Regions"}</b><p>Drag cards to reseed or move contestants. Lock favorites before randomizing.</p></div>
+      <div className="regionAdminTools">
+        {props.size >= 32 && <label className="compactSeedingSelect">
+          <span>Regional seeding</span>
+          <select value={props.seedingStyle} onChange={(event) => props.onSeedingStyle(event.target.value as SeedingStyle)} aria-label="Regional seeding style">
+            <option value="overall">Overall 1–{props.size}</option>
+            <option value="regional">Regional 1–16</option>
+          </select>
+        </label>}
+        <button className="secondaryAction" onClick={props.onRandomizeAll}>↝ Randomize all unlocked</button>
+      </div>
     </div>
 
     <div className={`regionAdminGrid regions-${regionCount}`}>
@@ -1448,6 +1469,7 @@ function AdminSettings({ settings, onChange, onReset }: { settings: AppSettings;
       <SettingSlider label="Default zoom" help="Starting zoom before Fit or Center is used." value={settings.defaultZoom} min={0.3} max={1.2} step={0.01} display={`${Math.round(settings.defaultZoom * 100)}%`} onChange={(value) => set("defaultZoom", value)} />
       <SettingSlider label="Minimum zoom" help="How far users can zoom out." value={settings.minimumZoom} min={0.1} max={0.6} step={0.01} display={`${Math.round(settings.minimumZoom * 100)}%`} onChange={(value) => set("minimumZoom", Math.min(value, settings.maximumZoom - 0.05))} />
       <SettingSlider label="Maximum zoom" help="How far users can zoom in." value={settings.maximumZoom} min={0.7} max={2} step={0.01} display={`${Math.round(settings.maximumZoom * 100)}%`} onChange={(value) => set("maximumZoom", Math.max(value, settings.minimumZoom + 0.05))} />
+      <SettingSlider label="Double-click / double-tap zoom" help="How much closer each double-click or double-tap moves the bracket." value={settings.doubleTapZoomPercent} min={5} max={100} step={5} display={`${settings.doubleTapZoomPercent}%`} onChange={(value) => set("doubleTapZoomPercent", value)} />
     </section>
     <section className="settingsPanel">
       <div className="settingsPanelTitle"><h2>Bracket Cards</h2><p>Adjust the amount of emphasis a matchup receives on hover.</p></div>
@@ -1697,7 +1719,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     const localX = clientX - rect.left;
     const localY = clientY - rect.top;
     const currentScale = scaleRef.current;
-    const nextScale = Math.min(settings.maximumZoom, currentScale * 1.25);
+    const nextScale = Math.min(settings.maximumZoom, currentScale * (1 + settings.doubleTapZoomPercent / 100));
     if (nextScale <= currentScale) return;
     const worldX = (localX - panRef.current.x) / currentScale;
     const worldY = (localY - panRef.current.y) / currentScale;

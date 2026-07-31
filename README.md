@@ -128,3 +128,7 @@ This version enforces owner-only editing and deletion in both the UI and Supabas
 - Zoom is anchored at the cursor/finger position.
 - Zoom respects the Admin maximum zoom setting.
 - Dragging, momentum panning, pinch zoom, wheel zoom, and toolbar controls remain available.
+
+## Adjustable point zoom
+
+Admin Settings now includes a Double-click / double-tap zoom control. The default is 35%, with a 5% to 100% range. The zoom remains centered on the cursor or finger and respects the configured maximum zoom.

@@ -582,3 +582,114 @@ header nav button.active{color:#fff}header nav button.active:after{content:"";he
   .canvasActions .readOnlyBadge,
   .canvasActions .primaryAction { grid-column: 1 / -1; }
 }
+
+/* v2.8 Manage Bracket layout polish */
+.manageSettingsGrid{
+  display:grid;
+  grid-template-columns:minmax(0,1.35fr) minmax(360px,.9fr);
+  gap:14px;
+  margin-bottom:18px;
+}
+.manageSettingsCard{
+  background:#fff;
+  border:1px solid var(--line);
+  border-radius:15px;
+  padding:16px;
+  box-shadow:0 8px 24px #16203708;
+}
+.manageIdentityCard{grid-row:span 2}
+.manageSectionHeading{display:flex;align-items:flex-start;gap:10px;margin-bottom:14px}
+.manageSectionHeading>span{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;background:#eef4fb;color:#1f5eaa;font-size:9px;font-weight:900}
+.manageSectionHeading b{display:block;font-size:13px;color:var(--ink)}
+.manageSectionHeading small{display:block;margin-top:3px;color:var(--muted);font-size:9px;line-height:1.4}
+.manageFieldGrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,.72fr);gap:14px;align-items:start}
+.manageTagsField{grid-row:span 2}
+.managePlayMode{display:grid!important;gap:6px!important;align-items:initial!important;font-size:9px!important;font-weight:850;text-transform:uppercase;letter-spacing:.08em}
+.managePlayMode select{width:100%;height:40px!important;margin:0!important}
+.manageSettingsCard .visibilityChoice{display:grid;gap:8px;padding:0;border:0;background:transparent}
+.manageSettingsCard .visibilityChoice>div:last-child{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.manageSettingsCard .visibilityChoice button{min-height:39px}
+.manageImportPanel{display:grid;gap:10px;padding:0;border:0;background:transparent}
+.manageImportPanel>div:first-child{display:none}
+.manageImportActions{display:grid;grid-template-columns:1fr auto;gap:9px;align-items:stretch}
+.manageImportActions input[type=file]{grid-column:1/-1;width:100%;min-height:42px;border:1px dashed #aebbd0;border-radius:10px;background:#f8fafc;padding:9px;color:var(--muted);font-size:9px}
+.manageImportActions textarea{min-height:108px;resize:vertical;border:1px solid #d6dde7;border-radius:10px;padding:11px;font:inherit;font-size:10px;line-height:1.45}
+.manageImportActions button{align-self:stretch;min-width:120px;border:0;border-radius:9px;background:var(--navy);color:#fff;padding:0 14px;font-size:9px;font-weight:850}
+.importMessage{display:block;border-radius:8px;background:#eef8f2;color:#267047;padding:8px 10px;font-size:9px}
+.manageSeedingCard{grid-column:2}
+.manageSeedingCard .seedingToggle{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.manageSeedingCard .seedingToggle button{min-width:0;min-height:68px;padding:10px}
+.regionAdminToolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:4px 0 10px;padding:0 2px}
+.regionAdminToolbar>div{display:grid;gap:2px}
+.regionAdminToolbar small{color:var(--red);font-size:8px;font-weight:900;letter-spacing:.13em}
+.regionAdminToolbar b{font-size:17px;color:var(--ink)}
+.regionAdminToolbar p{margin:1px 0 0;color:var(--muted);font-size:9px}
+.regionAdminToolbar button{height:38px;border:1px solid #b7c6da;border-radius:8px;background:#fff;color:#1f5eaa;padding:0 14px;font-size:9px;font-weight:850}
+.manageTopActions{overflow:visible!important}
+.manageTopActions>button{min-width:110px}
+
+@media(max-width:1000px){
+  .manageSettingsGrid{grid-template-columns:1fr}
+  .manageIdentityCard{grid-row:auto}
+  .manageSeedingCard{grid-column:auto}
+}
+@media(max-width:760px){
+  .manageSettingsGrid{gap:10px;margin-bottom:14px}
+  .manageSettingsCard{padding:13px;border-radius:12px}
+  .manageFieldGrid{grid-template-columns:1fr}
+  .manageTagsField{grid-row:auto}
+  .manageImportActions{grid-template-columns:1fr}
+  .manageImportActions button{min-height:42px}
+  .manageSeedingCard .seedingToggle{grid-template-columns:1fr}
+  .regionAdminToolbar{align-items:stretch;flex-direction:column}
+  .regionAdminToolbar button{width:100%;min-height:42px}
+  .manageTopActions{display:grid!important;grid-template-columns:1fr 1fr;gap:8px}
+  .manageTopActions>button{width:100%;min-width:0;min-height:42px}
+}
+
+/* Compact regional seeding control beside Randomize */
+.regionAdminTools{
+  display:flex;
+  align-items:flex-end;
+  justify-content:flex-end;
+  gap:9px;
+  flex:0 0 auto;
+}
+.compactSeedingSelect{
+  display:grid!important;
+  gap:4px!important;
+  margin:0!important;
+  min-width:164px;
+  font-size:8px!important;
+  font-weight:850;
+  letter-spacing:.07em;
+  text-transform:uppercase;
+  color:var(--muted);
+}
+.compactSeedingSelect select{
+  width:100%;
+  height:38px;
+  margin:0!important;
+  border:1px solid #b7c6da;
+  border-radius:8px;
+  background:#fff;
+  color:#1f3558;
+  padding:0 30px 0 11px;
+  font-size:9px;
+  font-weight:850;
+}
+.regionAdminTools>button{
+  flex:0 0 auto;
+  border-radius:8px!important;
+}
+
+@media(max-width:760px){
+  .regionAdminToolbar{gap:10px}
+  .regionAdminTools{width:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:end;gap:8px}
+  .compactSeedingSelect{min-width:0;width:100%}
+  .compactSeedingSelect select,.regionAdminTools>button{width:100%;min-height:42px;height:42px}
+}
+
+@media(max-width:430px){
+  .regionAdminTools{grid-template-columns:1fr}
+}

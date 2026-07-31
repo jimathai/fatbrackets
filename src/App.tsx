@@ -12,6 +12,8 @@ const sizes = [4, 8, 16, 32, 64];
 const premiumSize = 128;
 const colors = ["#ed4d4d", "#7c3aed", "#2563eb", "#0891b2", "#0f766e", "#ea580c", "#db2777", "#ca8a04"];
 const primaryTags = ["Music", "Movies & TV", "Sports", "Food", "Games", "People", "Anything Goes", "Undefined"];
+const nextMatchupModeKey = "fatbrackets:next-matchup-mode";
+const lastBracketKey = "fatbrackets:last-open-bracket";
 
 type View = "dashboard" | "explore" | "builder" | "manage" | "bracket" | "admin";
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -251,6 +253,11 @@ export default function Home() {
   }
 
   async function openTournament(tournament: Tournament, targetView: "manage" | "bracket" = "manage") {
+    const previousBracketId = window.localStorage.getItem(lastBracketKey);
+    if (previousBracketId && previousBracketId !== tournament.id) {
+      window.localStorage.setItem(nextMatchupModeKey, "false");
+    }
+    window.localStorage.setItem(lastBracketKey, tournament.id);
     setLoading(true);
     const [{ data: contestantRows }, { data: matchRows }] = await Promise.all([
       supabase.from("contestants").select("*").eq("tournament_id", tournament.id).order("seed"),
@@ -654,6 +661,11 @@ export default function Home() {
   async function openBracket() {
     const id = await saveTournament();
     if (!id) return;
+    const previousBracketId = window.localStorage.getItem(lastBracketKey);
+    if (previousBracketId && previousBracketId !== id) {
+      window.localStorage.setItem(nextMatchupModeKey, "false");
+    }
+    window.localStorage.setItem(lastBracketKey, id);
     if (contestants.some((item) => !item.name.trim())) {
       setSaveState("error");
       return;
@@ -896,6 +908,7 @@ export default function Home() {
 
       {view === "bracket" && (
         <Bracket
+          tournamentId={tournamentId}
           contestants={contestants}
           name={tournamentName}
           saveState={saveState}
@@ -1494,8 +1507,8 @@ function SettingSlider({ label, help, value, min, max, step, display, onChange }
   return <label className="settingRow"><div><b>{label}</b><small>{help}</small></div><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /><output>{display}</output></label>;
 }
 
-function Bracket({ contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, editable, participants, onSave, onClear, onEdit, onWinner }: {
-  contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; editable: boolean;
+function Bracket({ tournamentId, contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, editable, participants, onSave, onClear, onEdit, onWinner }: {
+  tournamentId: string | null; contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; editable: boolean;
   participants: (round: number, match: number) => Array<Contestant | null>; onSave: () => void; onClear: () => void; onEdit: () => void;
   onWinner: (round: number, match: number, contestant: Contestant) => void;
 }) {
@@ -1529,6 +1542,13 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   const [scale, setScale] = useState(settings.defaultZoom);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedRegion, setSelectedRegion] = useState("full");
+  const [nextMatchupMode, setNextMatchupMode] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(nextMatchupModeKey) === "true";
+  });
+  useEffect(() => {
+    setNextMatchupMode(window.localStorage.getItem(nextMatchupModeKey) === "true");
+  }, [tournamentId]);
   const rounds = Math.log2(size);
   const sideRounds = rounds - 1;
   const firstRoundMatchesPerSide = size / 4;
@@ -1692,12 +1712,22 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     return { minX, minY, maxX, maxY, firstRoundStart };
   }, [cardWidth, firstRoundMatchesPerSide, matchCenters, matchupHeight, regionRound, regionsPerSide, size]);
 
+  const setNextMode = useCallback((enabled: boolean) => {
+    setNextMatchupMode(enabled);
+    window.localStorage.setItem(nextMatchupModeKey, String(enabled));
+  }, []);
+
+  const leaveNextMatchupMode = useCallback(() => {
+    if (nextMatchupMode) setNextMode(false);
+  }, [nextMatchupMode, setNextMode]);
+
   const fitRegion = useCallback((regionIndex: number) => {
     const bounds = getRegionBounds(regionIndex);
     if (!bounds) return;
+    leaveNextMatchupMode();
     setSelectedRegion(String(regionIndex));
     fitBounds(bounds);
-  }, [fitBounds, getRegionBounds]);
+  }, [fitBounds, getRegionBounds, leaveNextMatchupMode]);
 
   const finalStageLabel = size === 128 ? "Final Eight" : size === 64 ? "Final Four" : "Championship";
   const finalStageOuterRounds = Math.max(0, sideRounds - regionRound);
@@ -1709,10 +1739,11 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     maxY: centerY + 430,
   }), [centerX, centerY, finalStageHalfWidth]);
 
-  const fitFinalStage = useCallback(() => {
+  const fitFinalStage = useCallback((preserveNextMode = false) => {
+    if (!preserveNextMode) leaveNextMatchupMode();
     setSelectedRegion("final-stage");
     fitBounds(finalStageBounds);
-  }, [finalStageBounds, fitBounds]);
+  }, [finalStageBounds, fitBounds, leaveNextMatchupMode]);
 
   const nextMatchup = useMemo(() => {
     const candidates: Array<{ round: number; match: number; seed: number }> = [];
@@ -1731,7 +1762,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
 
   const focusNextMatchup = useCallback(() => {
     if (!nextMatchup) {
-      fitFinalStage();
+      fitFinalStage(true);
       return;
     }
     if (nextMatchup.round === rounds) {
@@ -1764,14 +1795,20 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
 
   const winnersSignature = JSON.stringify(winners);
   useEffect(() => {
+    if (!nextMatchupMode) return;
     const timer = window.setTimeout(() => focusNextMatchup(), 80);
     return () => window.clearTimeout(timer);
-    // Focus once on open and again only when the bracket results change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [winnersSignature]);
+  }, [focusNextMatchup, nextMatchupMode, winnersSignature]);
 
   useEffect(() => () => stopMomentum(), [stopMomentum]);
   useEffect(() => { scaleRef.current = scale; }, [scale]);
+
+  function toggleNextMatchupMode() {
+    const enabled = !nextMatchupMode;
+    setNextMode(enabled);
+    if (enabled) window.setTimeout(() => focusNextMatchup(), 0);
+    else if (selectedRegion === "next") setSelectedRegion("full");
+  }
 
   function zoomBy(amount: number, originX?: number, originY?: number) {
     const viewport = viewportRef.current;
@@ -1997,8 +2034,8 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
       <div className="canvasOverlayNav">
         {regionCount > 0 && <select className="regionSelect" aria-label="Choose region" value={selectedRegion === "next" ? "next" : selectedRegion} onChange={(event) => {
           const value = event.target.value;
-          if (value === "full") { setSelectedRegion(value); fitCanvas(); }
-          else if (value === "next") focusNextMatchup();
+          if (value === "full") { leaveNextMatchupMode(); setSelectedRegion(value); fitCanvas(); }
+          else if (value === "next") { setNextMode(true); focusNextMatchup(); }
           else if (value === "final-stage") fitFinalStage();
           else fitRegion(Number(value));
         }}>
@@ -2007,7 +2044,14 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
           {effectiveRegionNames.map((region, index) => <option value={index} key={index}>{region}</option>)}
           <option value="final-stage">{finalStageLabel}</option>
         </select>}
-        <button className="nextMatchupButton" onClick={focusNextMatchup} disabled={!nextMatchup}>{nextMatchup ? `Next: Round ${nextMatchup.round}, Seed ${nextMatchup.seed}` : "Bracket complete"}</button>
+        <button
+          className={`nextMatchupButton ${nextMatchupMode ? "active" : ""}`}
+          onClick={toggleNextMatchupMode}
+          aria-pressed={nextMatchupMode}
+          title={nextMatchupMode ? "Turn off automatic next-matchup focus" : "Turn on automatic next-matchup focus"}
+        >
+          {nextMatchup ? `${nextMatchupMode ? "Following" : "Next"}: Round ${nextMatchup.round}, Seed ${nextMatchup.seed}` : nextMatchupMode ? "Following: Complete" : "Bracket complete"}
+        </button>
       </div>
       <div className="viewportControls" aria-label="Bracket canvas controls">
         <button onClick={() => zoomBy(-0.1)} aria-label="Zoom out">−</button>

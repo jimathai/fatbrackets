@@ -132,3 +132,13 @@ This version enforces owner-only editing and deletion in both the UI and Supabas
 ## Adjustable point zoom
 
 Admin Settings now includes a Double-click / double-tap zoom control. The default is 35%, with a 5% to 100% range. The zoom remains centered on the cursor or finger and respects the configured maximum zoom.
+
+## Canvas UX update
+
+- Canvas panning is bounded so the bracket can never be moved completely offscreen.
+- Save status remains directly beside the Save bracket button.
+- Larger bracket title with region navigation overlaid at the upper-left of the canvas.
+- Region dropdown uses “All” and includes Next matchup navigation.
+- Brackets open on the next incomplete matchup and automatically advance focus after each winner selection.
+- Admin settings now include canvas background color, pattern, and tint.
+- Regional axis guides visually divide the canvas.

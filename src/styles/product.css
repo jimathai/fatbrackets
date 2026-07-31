@@ -693,3 +693,41 @@ header nav button.active{color:#fff}header nav button.active:after{content:"";he
 @media(max-width:430px){
   .regionAdminTools{grid-template-columns:1fr}
 }
+
+/* Canvas navigation and background controls */
+.canvasHeading h1{font-size:29px;line-height:1.05}
+.saveActionGroup{display:flex;align-items:center;gap:8px}
+.saveActionGroup .saveStatus{font-size:9px;white-space:nowrap}
+.canvasOverlayNav{position:absolute;top:10px;left:12px;z-index:24;display:flex;align-items:center;gap:7px;pointer-events:auto}
+.canvasOverlayNav .regionSelect,.nextMatchupButton{height:32px;border-radius:8px;border:1px solid #425573;background:rgba(18,31,53,.96);color:#fff;font-size:10px;font-weight:850;box-shadow:0 8px 22px rgba(0,0,0,.24)}
+.canvasOverlayNav .regionSelect{min-width:132px;padding:0 30px 0 11px}
+.nextMatchupButton{padding:0 12px;cursor:pointer}
+.nextMatchupButton:disabled{opacity:.55;cursor:default}
+.viewportControls{left:auto;right:12px}
+.bracketViewport{background-color:var(--canvas-bg,#0a1428);background-image:none}
+.bracketViewport::before{content:"";position:absolute;inset:0;z-index:0;pointer-events:none;background:rgba(255,255,255,var(--canvas-tint,0))}
+.bracketViewport.pattern-grid{background-image:radial-gradient(circle at center,#1d31522b,transparent 48%),linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:auto,36px 36px,36px 36px}
+.bracketViewport.pattern-dots{background-image:radial-gradient(circle,rgba(255,255,255,.12) 1px,transparent 1.5px);background-size:24px 24px}
+.bracketViewport.pattern-crosshatch{background-image:linear-gradient(45deg,transparent 47%,rgba(255,255,255,.06) 48%,rgba(255,255,255,.06) 52%,transparent 53%),linear-gradient(-45deg,transparent 47%,rgba(255,255,255,.06) 48%,rgba(255,255,255,.06) 52%,transparent 53%);background-size:34px 34px}
+.bracketCanvas{z-index:1}
+.regionAxes{position:absolute;inset:0;z-index:0;pointer-events:none}
+.regionAxis{position:absolute;display:block;background:rgba(255,255,255,.13);box-shadow:0 0 14px rgba(255,255,255,.035)}
+.regionAxis.vertical{top:0;bottom:0;width:2px;transform:translateX(-1px)}
+.regionAxis.horizontal{left:0;right:0;height:2px;transform:translateY(-1px)}
+.settingRow select{height:38px;border:1px solid #33445f;border-radius:8px;background:#111d31;color:#fff;padding:0 32px 0 11px;font-weight:750}
+.settingColorRow input[type="color"]{width:72px;height:38px;padding:3px;border:1px solid #33445f;border-radius:8px;background:#111d31}
+
+@media(max-width:800px){
+  .canvasHeading h1{font-size:23px}
+  .canvasActions .saveStatus{display:inline}
+  .saveActionGroup{gap:5px}
+  .canvasOverlayNav{top:7px;left:7px;right:7px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr)}
+  .canvasOverlayNav .regionSelect,.nextMatchupButton{width:100%;min-width:0;padding-inline:8px;overflow:hidden;text-overflow:ellipsis}
+  .viewportControls{right:8px;left:auto;bottom:8px}
+}
+@media(max-width:520px){
+  .canvasHeading{grid-template-columns:minmax(0,1fr);gap:7px}
+  .canvasActions{max-width:none;width:100%;overflow:visible;display:flex;flex-wrap:wrap;justify-content:flex-start}
+  .saveActionGroup{margin-left:auto}
+  .saveActionGroup .saveStatus{font-size:8px}
+}

@@ -59,6 +59,9 @@ type AppSettings = {
   maximumZoom: number;
   matchupHoverScale: number;
   doubleTapZoomPercent: number;
+  canvasBackgroundColor: string;
+  canvasPattern: "grid" | "dots" | "crosshatch" | "none";
+  canvasTint: number;
 };
 
 const defaultAppSettings: AppSettings = {
@@ -69,6 +72,9 @@ const defaultAppSettings: AppSettings = {
   maximumZoom: 1.35,
   matchupHoverScale: 1.06,
   doubleTapZoomPercent: 35,
+  canvasBackgroundColor: "#0a1428",
+  canvasPattern: "grid",
+  canvasTint: 0,
 };
 
 function loadAppSettings(): AppSettings {
@@ -1472,6 +1478,12 @@ function AdminSettings({ settings, onChange, onReset }: { settings: AppSettings;
       <SettingSlider label="Double-click / double-tap zoom" help="How much closer each double-click or double-tap moves the bracket." value={settings.doubleTapZoomPercent} min={5} max={100} step={5} display={`${settings.doubleTapZoomPercent}%`} onChange={(value) => set("doubleTapZoomPercent", value)} />
     </section>
     <section className="settingsPanel">
+      <div className="settingsPanelTitle"><h2>Canvas Background</h2><p>Choose the canvas color, pattern, and tint behind every bracket.</p></div>
+      <label className="settingRow settingColorRow"><div><b>Background color</b><small>The base color behind the bracket.</small></div><input type="color" value={settings.canvasBackgroundColor} onChange={(event) => set("canvasBackgroundColor", event.target.value)} /><output>{settings.canvasBackgroundColor.toUpperCase()}</output></label>
+      <label className="settingRow"><div><b>Background pattern</b><small>Add a subtle guide pattern behind the bracket.</small></div><select value={settings.canvasPattern} onChange={(event) => set("canvasPattern", event.target.value as AppSettings["canvasPattern"])}><option value="grid">Grid</option><option value="dots">Dots</option><option value="crosshatch">Crosshatch</option><option value="none">None</option></select><output>{settings.canvasPattern}</output></label>
+      <SettingSlider label="Background tint" help="Adds a soft white tint over the selected background." value={settings.canvasTint} min={0} max={30} step={1} display={`${settings.canvasTint}%`} onChange={(value) => set("canvasTint", value)} />
+    </section>
+    <section className="settingsPanel">
       <div className="settingsPanelTitle"><h2>Bracket Cards</h2><p>Adjust the amount of emphasis a matchup receives on hover.</p></div>
       <SettingSlider label="Matchup hover size" help="The scale applied when a user hovers over a matchup." value={settings.matchupHoverScale} min={1} max={1.18} step={0.01} display={`${Math.round((settings.matchupHoverScale - 1) * 100)}% larger`} onChange={(value) => set("matchupHoverScale", value)} />
     </section>
@@ -1536,10 +1548,28 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
   const regionRound = size >= 32 ? 4 : 0;
   const effectiveRegionNames = regionCount ? Array.from({ length: regionCount }, (_, index) => regionNames[index]?.trim() || `Region ${index + 1}`) : [];
 
-  const updatePan = useCallback((nextPan: { x: number; y: number }) => {
-    panRef.current = nextPan;
-    setPan(nextPan);
-  }, []);
+  const clampPan = useCallback((nextPan: { x: number; y: number }, nextScale = scaleRef.current) => {
+    const viewport = viewportRef.current;
+    if (!viewport) return nextPan;
+    const scaledWidth = canvasWidth * nextScale;
+    const scaledHeight = canvasHeight * nextScale;
+    const visibleX = Math.min(150, viewport.clientWidth * 0.34, scaledWidth * 0.34);
+    const visibleY = Math.min(120, viewport.clientHeight * 0.34, scaledHeight * 0.34);
+    const minX = visibleX - scaledWidth;
+    const maxX = viewport.clientWidth - visibleX;
+    const minY = visibleY - scaledHeight;
+    const maxY = viewport.clientHeight - visibleY;
+    return {
+      x: Math.min(maxX, Math.max(minX, nextPan.x)),
+      y: Math.min(maxY, Math.max(minY, nextPan.y)),
+    };
+  }, [canvasHeight, canvasWidth]);
+
+  const updatePan = useCallback((nextPan: { x: number; y: number }, nextScale = scaleRef.current) => {
+    const bounded = clampPan(nextPan, nextScale);
+    panRef.current = bounded;
+    setPan(bounded);
+  }, [clampPan]);
 
   const updateScale = useCallback((nextScale: number) => {
     scaleRef.current = nextScale;
@@ -1684,6 +1714,45 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     fitBounds(finalStageBounds);
   }, [finalStageBounds, fitBounds]);
 
+  const nextMatchup = useMemo(() => {
+    const candidates: Array<{ round: number; match: number; seed: number }> = [];
+    for (let round = 1; round <= rounds; round++) {
+      const count = size / 2 ** round;
+      for (let match = 0; match < count; match++) {
+        const options = participants(round, match);
+        if (options[0] && options[1] && !winners[matchKey(round, match)]) {
+          candidates.push({ round, match, seed: Math.min(displayedSeed(options[0], size, seedingStyle), displayedSeed(options[1], size, seedingStyle)) });
+        }
+      }
+      if (candidates.length) break;
+    }
+    return candidates.sort((a, b) => a.seed - b.seed || a.match - b.match)[0] ?? null;
+  }, [participants, rounds, seedingStyle, size, winners]);
+
+  const focusNextMatchup = useCallback(() => {
+    if (!nextMatchup) {
+      fitFinalStage();
+      return;
+    }
+    if (nextMatchup.round === rounds) {
+      fitBounds({ minX: centerX - 250, minY: centerY - 255, maxX: centerX + 250, maxY: centerY + 255 });
+      return;
+    }
+    const totalCount = size / 2 ** nextMatchup.round;
+    const sideCount = totalCount / 2;
+    const side = nextMatchup.match < sideCount ? "left" : "right";
+    const center = matchCenters.get(`${side}-${nextMatchup.round}-${nextMatchup.match}`);
+    if (!center) return;
+    setSelectedRegion("next");
+    fitBounds({ minX: center.x - cardWidth / 2 - 28, minY: center.y - matchupHeight / 2 - 54, maxX: center.x + cardWidth / 2 + 28, maxY: center.y + matchupHeight / 2 + 28 });
+  }, [cardWidth, centerX, centerY, fitBounds, fitFinalStage, matchCenters, matchupHeight, nextMatchup, rounds, size]);
+
+  const regionSeparatorYs = useMemo(() => {
+    if (regionCount <= 2) return [];
+    const bounds = Array.from({ length: regionsPerSide }, (_, index) => getRegionBounds(index)).filter((value): value is NonNullable<ReturnType<typeof getRegionBounds>> => Boolean(value)).sort((a, b) => a.minY - b.minY);
+    return bounds.slice(0, -1).map((boundsItem, index) => (boundsItem.maxY + bounds[index + 1].minY) / 2);
+  }, [getRegionBounds, regionCount, regionsPerSide]);
+
   useEffect(() => {
     fitCanvas();
     const viewport = viewportRef.current;
@@ -1692,6 +1761,14 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
     observer.observe(viewport);
     return () => observer.disconnect();
   }, [fitCanvas]);
+
+  const winnersSignature = JSON.stringify(winners);
+  useEffect(() => {
+    const timer = window.setTimeout(() => focusNextMatchup(), 80);
+    return () => window.clearTimeout(timer);
+    // Focus once on open and again only when the bracket results change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [winnersSignature]);
 
   useEffect(() => () => stopMomentum(), [stopMomentum]);
   useEffect(() => { scaleRef.current = scale; }, [scale]);
@@ -1896,26 +1973,15 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
         <p>Drag to move. Scroll or pinch to zoom. Double-click or double-tap to zoom toward that point.</p>
       </div>
       <div className="canvasActions">
-        {editable ? <SaveLabel state={saveState} /> : <span className="readOnlyBadge">View only</span>}
-        {regionCount > 0 &&
-          <select className="regionSelect" aria-label="Choose region" value={selectedRegion} onChange={(event) => {
-            const value = event.target.value;
-            if (value === "full") { setSelectedRegion(value); fitCanvas(); }
-            else if (value === "final-stage") fitFinalStage();
-            else fitRegion(Number(value));
-          }}>
-            <option value="full">Full bracket</option>
-            {effectiveRegionNames.map((region, index) => <option value={index} key={index}>{region}</option>)}
-            <option value="final-stage">{finalStageLabel}</option>
-          </select>
-        }
+        {!editable && <span className="readOnlyBadge">View only</span>}
         {editable && <button className="compactAction clearBracketAction" onClick={onClear}>Clear</button>}
         {editable && <button className="compactAction darkSecondary" onClick={onEdit}>Edit bracket</button>}
-        {editable && <button className="compactAction primaryAction" onClick={onSave}>Save bracket</button>}
+        {editable && <div className="saveActionGroup"><button className="compactAction primaryAction" onClick={onSave}>Save bracket</button><SaveLabel state={saveState} /></div>}
       </div>
     </div>
     <div
-      className="bracketViewport"
+      className={`bracketViewport pattern-${settings.canvasPattern}`}
+      style={{ "--canvas-bg": settings.canvasBackgroundColor, "--canvas-tint": settings.canvasTint / 100 } as CSSProperties}
       ref={viewportRef}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -1928,6 +1994,21 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
       }}
       onWheel={(event) => { event.preventDefault(); zoomBy(event.deltaY > 0 ? -0.07 : 0.07, event.clientX, event.clientY); }}
     >
+      <div className="canvasOverlayNav">
+        {regionCount > 0 && <select className="regionSelect" aria-label="Choose region" value={selectedRegion === "next" ? "next" : selectedRegion} onChange={(event) => {
+          const value = event.target.value;
+          if (value === "full") { setSelectedRegion(value); fitCanvas(); }
+          else if (value === "next") focusNextMatchup();
+          else if (value === "final-stage") fitFinalStage();
+          else fitRegion(Number(value));
+        }}>
+          <option value="full">All</option>
+          <option value="next">Next matchup</option>
+          {effectiveRegionNames.map((region, index) => <option value={index} key={index}>{region}</option>)}
+          <option value="final-stage">{finalStageLabel}</option>
+        </select>}
+        <button className="nextMatchupButton" onClick={focusNextMatchup} disabled={!nextMatchup}>{nextMatchup ? `Next: Round ${nextMatchup.round}, Seed ${nextMatchup.seed}` : "Bracket complete"}</button>
+      </div>
       <div className="viewportControls" aria-label="Bracket canvas controls">
         <button onClick={() => zoomBy(-0.1)} aria-label="Zoom out">−</button>
         <span>{Math.round(scale * 100)}%</span>
@@ -1935,6 +2016,7 @@ function Bracket({ contestants, name, saveState, size, winners, regionNames, see
         <button onClick={fitCanvas}>Center</button>
       </div>
       <div className="bracketCanvas" style={{ width: canvasWidth, height: canvasHeight, transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}>
+        {regionCount > 0 && <div className="regionAxes" aria-hidden="true"><i className="regionAxis vertical" style={{ left: centerX }} />{regionSeparatorYs.map((axisY, index) => <i className="regionAxis horizontal" style={{ top: axisY }} key={index} />)}</div>}
         <svg className="bracketConnectors" width={canvasWidth} height={canvasHeight} aria-hidden="true">
           {(["left", "right"] as const).flatMap((side) => {
             const paths: ReactNode[] = [];

@@ -4,6 +4,8 @@ import type { Session } from "@supabase/supabase-js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { supabase } from "./lib/supabase";
+import { processContestantImage, processCroppedContestantImage } from "./lib/imageProcessing";
+import type { ProcessedImage } from "./lib/imageProcessing";
 import "./styles/globals.css";
 import "./styles/auth.css";
 import "./styles/product.css";
@@ -30,6 +32,7 @@ type Tournament = {
   updated_at: string;
   cloned_from_id?: string | null;
   cloned_from_name?: string | null;
+  theme_json?: BracketTheme | null;
 };
 type Contestant = {
   id?: string;
@@ -38,6 +41,7 @@ type Contestant = {
   shortName: string;
   details: string;
   imageUrl: string;
+  imageAssetId?: string | null;
   accentColor: string;
   locked?: boolean;
   overallSeed?: number;
@@ -48,10 +52,57 @@ type ImportedEntry = {
   description?: string;
   imageUrl?: string;
 };
+type ImageUploadPayload = File | { processed: ProcessedImage; label: string };
 type WinnerMap = Record<string, string>;
 type PlayMode = "manual" | "voting" | "random";
-type SeedingStyle = "regional" | "overall";
+type SeedingStyle = "regional" | "overall" | "seedless";
 type EntryMethod = "manual" | "paste" | "upload";
+
+
+type BracketTheme = {
+  preset: "classic" | "heavyweight" | "neon" | "minimal";
+  canvasBackgroundColor: string;
+  canvasGradientEnd: string;
+  canvasPattern: "grid" | "dots" | "crosshatch" | "none";
+  canvasTint: number;
+  connectorColor: string;
+  connectorWidth: number;
+  connectorStyle: "solid" | "dashed" | "dotted";
+  cardBackground: string;
+  cardHoverBackground: string;
+  advancedRoundCardBackground: string;
+  selectedCardBackground: string;
+  cardBorderColor: string;
+  cardBorderWidth: number;
+  cardRadius: number;
+  cardShadow: number;
+  imageShape: "rounded" | "circle" | "square";
+  imageFit: "cover" | "contain";
+  showRegionAxes: boolean;
+  winnerMark: "star" | "crown" | "trophy" | "bolt" | "none";
+  winnerMarkColor: string;
+};
+
+type SharedBracketStyle = {
+  id: string;
+  owner_id: string;
+  name: string;
+  theme_json: BracketTheme;
+  usage_count: number;
+  created_at: string;
+};
+
+const defaultBracketTheme: BracketTheme = {
+  preset: "classic", canvasBackgroundColor: "#0a1428", canvasGradientEnd: "#13213a", canvasPattern: "grid", canvasTint: 0, connectorColor: "#536581", connectorWidth: 3, connectorStyle: "solid",
+  cardBackground: "#14223b", cardHoverBackground: "#203454", advancedRoundCardBackground: "#101c31", selectedCardBackground: "#263d62", cardBorderColor: "#32435e", cardBorderWidth: 1, cardRadius: 14, cardShadow: 65, imageShape: "rounded", imageFit: "cover", showRegionAxes: true, winnerMark: "star", winnerMarkColor: "#ed4d4d",
+};
+
+const themePresets: Record<BracketTheme["preset"], Partial<BracketTheme>> = {
+  classic: defaultBracketTheme,
+  heavyweight: { canvasBackgroundColor: "#140a08", canvasGradientEnd: "#26120f", canvasPattern: "crosshatch", canvasTint: 8, connectorColor: "#f97316", connectorWidth: 7, cardBackground: "#211714", advancedRoundCardBackground: "#180f0c", selectedCardBackground: "#4a2417", cardBorderColor: "#fb923c", cardBorderWidth: 3, cardRadius: 8, cardShadow: 85, imageShape: "square" },
+  neon: { canvasBackgroundColor: "#08051a", canvasGradientEnd: "#170b2b", canvasPattern: "grid", canvasTint: 4, connectorColor: "#22d3ee", connectorWidth: 4, cardBackground: "#15102b", advancedRoundCardBackground: "#0e0920", selectedCardBackground: "#352061", cardBorderColor: "#d946ef", cardBorderWidth: 2, cardRadius: 18, cardShadow: 90, imageShape: "circle" },
+  minimal: { canvasBackgroundColor: "#eef2f7", canvasGradientEnd: "#f8fafc", canvasPattern: "none", canvasTint: 0, connectorColor: "#94a3b8", connectorWidth: 2, cardBackground: "#ffffff", advancedRoundCardBackground: "#f1f5f9", selectedCardBackground: "#dbeafe", cardBorderColor: "#cbd5e1", cardBorderWidth: 1, cardRadius: 10, cardShadow: 20, imageShape: "rounded" },
+};
 
 type AppSettings = {
   frictionStrength: number;
@@ -171,6 +222,7 @@ function matchKey(round: number, match: number) {
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [view, setView] = useState<View>("dashboard");
+  const [viewHistory, setViewHistory] = useState<View[]>([]);
   const [loading, setLoading] = useState(true);
   const [tournaments, setTournaments] = useState<Tournament[]>([]);
   const [publicBrackets, setPublicBrackets] = useState<Tournament[]>([]);
@@ -194,6 +246,24 @@ export default function Home() {
   const [authMode, setAuthMode] = useState<"login" | "signup">("login");
   const [authMessage, setAuthMessage] = useState("");
   const [appSettings, setAppSettings] = useState<AppSettings>(loadAppSettings);
+  const [bracketTheme, setBracketTheme] = useState<BracketTheme>(defaultBracketTheme);
+
+  function navigate(nextView: View, options?: { replace?: boolean }) {
+    if (nextView === view) return;
+    if (!options?.replace) setViewHistory((history) => [...history, view].slice(-30));
+    setView(nextView);
+  }
+
+  function goBack() {
+    setViewHistory((history) => {
+      if (!history.length) return history;
+      const previous = history[history.length - 1];
+      setView(previous);
+      if (previous === "dashboard") loadDashboard();
+      if (previous === "explore") loadExplore();
+      return history.slice(0, -1);
+    });
+  }
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -215,7 +285,7 @@ export default function Home() {
     setLoading(true);
     const { data } = await supabase
       .from("tournaments")
-      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name")
+      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
       .eq("owner_id", session?.user.id ?? "")
       .order("updated_at", { ascending: false });
     setTournaments((data ?? []) as Tournament[]);
@@ -226,7 +296,7 @@ export default function Home() {
     setLoading(true);
     const { data } = await supabase
       .from("tournaments")
-      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name")
+      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
       .eq("visibility", "public")
       .in("status", ["published", "completed"])
       .order("updated_at", { ascending: false })
@@ -249,7 +319,8 @@ export default function Home() {
     setWinners({});
     setSelectedSeed(null);
     setSaveState("idle");
-    setView("builder");
+    setBracketTheme(defaultBracketTheme);
+    navigate("builder");
   }
 
   async function openTournament(tournament: Tournament, targetView: "manage" | "bracket" = "manage") {
@@ -272,6 +343,7 @@ export default function Home() {
         shortName: row.short_name ?? "",
         details: row.details ?? "",
         imageUrl: row.image_url ?? "",
+        imageAssetId: row.image_asset_id ?? null,
         accentColor: row.accent_color ?? colors[(row.seed - 1) % colors.length],
         overallSeed: row.seed,
       };
@@ -282,6 +354,7 @@ export default function Home() {
     });
     setTournamentId(tournament.id);
     setActiveTournament(tournament);
+    setBracketTheme({ ...defaultBracketTheme, ...(tournament.theme_json ?? {}) });
     setTournamentName(tournament.name);
     setSize(tournament.bracket_size);
     setPlayMode(tournament.voting_enabled ? "voting" : "manual");
@@ -294,7 +367,7 @@ export default function Home() {
       setRegionNames(defaultRegionNames(tournament.bracket_size));
     }
     const storedSeedingStyle = window.localStorage.getItem(`fatbrackets:seeding-style:${tournament.id}`) as SeedingStyle | null;
-    const nextSeedingStyle: SeedingStyle = storedSeedingStyle === "overall" ? "overall" : "regional";
+    const nextSeedingStyle: SeedingStyle = storedSeedingStyle === "overall" || storedSeedingStyle === "seedless" ? storedSeedingStyle : "regional";
     setSeedingStyle(nextSeedingStyle);
     const storedOverallSeeds = window.localStorage.getItem(`fatbrackets:overall-seeds:${tournament.id}`);
     try {
@@ -317,14 +390,14 @@ export default function Home() {
     setSelectedSeed(null);
     setSaveState("saved");
     const canManage = Boolean(session && tournament.owner_id === session.user.id);
-    setView(targetView === "manage" && !canManage ? "bracket" : targetView);
+    navigate(targetView === "manage" && !canManage ? "bracket" : targetView);
     setLoading(false);
   }
 
   async function openOriginalBracket(originalId: string) {
     const { data, error } = await supabase
       .from("tournaments")
-      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name")
+      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
       .eq("id", originalId)
       .single();
     if (error || !data) {
@@ -342,7 +415,7 @@ export default function Home() {
     setLoading(true);
     const { data: sourceContestants, error: contestantError } = await supabase
       .from("contestants")
-      .select("seed,name,short_name,details,image_url,accent_color")
+      .select("seed,name,short_name,details,image_url,image_asset_id,accent_color")
       .eq("tournament_id", source.id)
       .order("seed");
     if (contestantError) {
@@ -367,7 +440,7 @@ export default function Home() {
         cloned_from_id: source.id,
         cloned_from_name: source.name,
       })
-      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name")
+      .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
       .single();
     if (cloneError || !cloned) {
       setLoading(false);
@@ -382,6 +455,7 @@ export default function Home() {
         short_name: item.short_name,
         details: item.details,
         image_url: item.image_url,
+        image_asset_id: item.image_asset_id,
         accent_color: item.accent_color,
       })));
       if (copyError) {
@@ -546,20 +620,39 @@ export default function Home() {
     setSaveState("idle");
   }
 
-  async function uploadContestantImage(seed: number, file: File) {
+  async function uploadContestantImage(seed: number, source: ImageUploadPayload) {
     if (!session) { setAuthOpen(true); return; }
     let activeId = tournamentId;
     if (!activeId) activeId = await saveTournament();
     if (!activeId) return;
-    const extension = file.name.split(".").pop()?.toLowerCase() || "jpg";
-    const safeExtension = ["jpg", "jpeg", "png", "webp", "gif"].includes(extension) ? extension : "jpg";
-    const path = `${session.user.id}/${activeId}/${crypto.randomUUID()}.${safeExtension}`;
     setSaveState("saving");
-    const { error } = await supabase.storage.from("contestant-images").upload(path, file, { cacheControl: "3600", upsert: false });
-    if (error) { setSaveState("error"); return; }
-    const { data } = supabase.storage.from("contestant-images").getPublicUrl(path);
-    updateContestant(seed, { imageUrl: data.publicUrl });
-    setSaveState("idle");
+    try {
+      const contestant = contestants.find((item) => item.seed === seed);
+      const processed = source instanceof File ? await processContestantImage(source) : source.processed;
+      const label = source instanceof File ? source.name : source.label;
+      const { data: existing } = await supabase.from("image_assets").select("id,public_url").eq("content_hash", processed.hash).maybeSingle();
+      if (existing) {
+        updateContestant(seed, { imageUrl: existing.public_url, imageAssetId: existing.id });
+        setSaveState("idle");
+        return;
+      }
+      const path = `${session.user.id}/library/${processed.hash}.webp`;
+      const { error: uploadError } = await supabase.storage.from("contestant-images").upload(path, processed.blob, { contentType: "image/webp", cacheControl: "31536000", upsert: false });
+      if (uploadError && !uploadError.message.toLowerCase().includes("already exists")) throw uploadError;
+      const { data: publicData } = supabase.storage.from("contestant-images").getPublicUrl(path);
+      const normalizedName = (contestant?.name || label.replace(/\.[^.]+$/, "")).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const { data: asset, error: assetError } = await supabase.from("image_assets").insert({
+        owner_id: session.user.id, label: contestant?.name || label, normalized_name: normalizedName, storage_path: path, public_url: publicData.publicUrl,
+        content_hash: processed.hash, width: processed.width, height: processed.height, file_size: processed.blob.size, mime_type: "image/webp",
+      }).select("id,public_url").single();
+      if (assetError) throw assetError;
+      updateContestant(seed, { imageUrl: asset.public_url, imageAssetId: asset.id });
+      setSaveState("idle");
+    } catch (error) {
+      console.error(error);
+      window.alert(error instanceof Error ? error.message : "Could not upload image.");
+      setSaveState("error");
+    }
   }
 
   async function saveTournament(): Promise<string | null> {
@@ -576,7 +669,7 @@ export default function Home() {
       }
       const { error } = await supabase
         .from("tournaments")
-        .update({ name: tournamentName.trim(), bracket_size: size, tags, visibility, status: visibility === "public" ? "published" : "draft", voting_enabled: playMode === "voting", updated_at: new Date().toISOString() })
+        .update({ name: tournamentName.trim(), bracket_size: size, tags, visibility, status: visibility === "public" ? "published" : "draft", voting_enabled: playMode === "voting", theme_json: bracketTheme, updated_at: new Date().toISOString() })
         .eq("id", activeId)
         .eq("owner_id", session.user.id);
       if (error) return failSave();
@@ -584,8 +677,8 @@ export default function Home() {
       const slug = `${tournamentName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "tournament"}-${crypto.randomUUID().slice(0, 8)}`;
       const { data, error } = await supabase
         .from("tournaments")
-        .insert({ owner_id: session.user.id, name: tournamentName.trim(), slug, bracket_size: size, tags, visibility, status: visibility === "public" ? "published" : "draft", voting_enabled: playMode === "voting" })
-        .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name")
+        .insert({ owner_id: session.user.id, name: tournamentName.trim(), slug, bracket_size: size, tags, visibility, status: visibility === "public" ? "published" : "draft", voting_enabled: playMode === "voting", theme_json: bracketTheme })
+        .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
         .single();
       if (error || !data) return failSave();
       activeId = data.id;
@@ -634,6 +727,7 @@ export default function Home() {
           short_name: item.shortName.trim() || item.name.trim(),
           details: item.details.trim(),
           image_url: item.imageUrl.trim() || null,
+          image_asset_id: item.imageAssetId ?? null,
           accent_color: item.accentColor,
           updated_at: new Date().toISOString(),
         })), { onConflict: "id" })
@@ -784,9 +878,11 @@ export default function Home() {
       <AppHeader
         session={session}
         view={view}
-        onDashboard={() => { setView("dashboard"); loadDashboard(); }}
-        onExplore={() => { setView("explore"); loadExplore(); }}
-        onAdmin={() => setView("admin")}
+        canGoBack={viewHistory.length > 0}
+        onBack={goBack}
+        onDashboard={() => { navigate("dashboard"); loadDashboard(); }}
+        onExplore={() => { navigate("explore"); loadExplore(); }}
+        onAdmin={() => navigate("admin")}
         onSignIn={() => setAuthOpen(true)}
       />
 
@@ -812,6 +908,7 @@ export default function Home() {
           onClone={cloneTournament}
           onOpenOriginal={openOriginalBracket}
           canClone={Boolean(session)}
+          currentUserId={session?.user.id ?? null}
         />
       )}
 
@@ -823,7 +920,7 @@ export default function Home() {
           search={search}
           selectedSeed={selectedSeed}
           size={size}
-          onBack={() => { setView("dashboard"); loadDashboard(); }}
+          onBack={goBack}
           onBracket={openBracket}
           onChangeName={(value) => { setTournamentName(value); setSaveState("idle"); }}
           onChangeSize={changeSize}
@@ -868,7 +965,7 @@ export default function Home() {
           visibility={visibility}
           seedingStyle={seedingStyle}
           selectedSeed={selectedSeed}
-          onBack={() => { setView("dashboard"); loadDashboard(); }}
+          onBack={goBack}
           onOpenBracket={openBracket}
           onSave={saveTournament}
           onName={(value) => { setTournamentName(value); setSaveState("idle"); }}
@@ -894,6 +991,10 @@ export default function Home() {
           clonedFromId={activeTournament?.cloned_from_id ?? null}
           clonedFromName={activeTournament?.cloned_from_name ?? null}
           onOpenOriginal={openOriginalBracket}
+          theme={bracketTheme}
+          settings={appSettings}
+          currentUserId={session!.user.id}
+          onThemeChange={(nextTheme: BracketTheme) => { setBracketTheme(nextTheme); setSaveState("idle"); }}
         />
       )}
 
@@ -917,11 +1018,12 @@ export default function Home() {
           regionNames={regionNames}
           seedingStyle={seedingStyle}
           settings={appSettings}
+          theme={bracketTheme}
           editable={activeIsOwner}
           participants={roundParticipants}
           onSave={saveBracket}
           onClear={clearBracket}
-          onEdit={() => setView("manage")}
+          onEdit={() => navigate("manage")}
           onWinner={selectWinner}
         />
       )}
@@ -943,8 +1045,9 @@ export default function Home() {
   );
 }
 
-function AppHeader({ session, view, onDashboard, onExplore, onAdmin, onSignIn }: { session: Session | null; view: View; onDashboard: () => void; onExplore: () => void; onAdmin: () => void; onSignIn: () => void }) {
-  return <header>
+function AppHeader({ session, view, canGoBack, onBack, onDashboard, onExplore, onAdmin, onSignIn }: { session: Session | null; view: View; canGoBack: boolean; onBack: () => void; onDashboard: () => void; onExplore: () => void; onAdmin: () => void; onSignIn: () => void }) {
+  return <header className="appHeader">
+    <button className="appBackButton" onClick={onBack} disabled={!canGoBack} aria-label="Go back">←</button>
     <button className="brand brandButton" onClick={onDashboard}><i>///</i>Fat<span>Brackets</span></button>
     <nav><button className={view === "dashboard" ? "active" : ""} onClick={onDashboard}>My Brackets</button><button className={view === "explore" ? "active" : ""} onClick={onExplore}>Explore</button>{session && <button className={view === "admin" ? "active" : ""} onClick={onAdmin}>Admin</button>}</nav>
     {session
@@ -976,7 +1079,7 @@ function Dashboard({ loading, session, tournaments, onNew, onOpen, onManage, onC
   </div>;
 }
 
-function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal, canClone }: { loading: boolean; brackets: Tournament[]; onOpen: (item: Tournament) => void; onCreate: () => void; onClone: (item: Tournament) => void; onOpenOriginal: (id: string) => void; canClone: boolean }) {
+function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal, canClone, currentUserId }: { loading: boolean; brackets: Tournament[]; onOpen: (item: Tournament) => void; onCreate: () => void; onClone: (item: Tournament) => void; onOpenOriginal: (id: string) => void; canClone: boolean; currentUserId: string | null }) {
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const categories = [
     { icon: "♫", title: "Music", text: "Songs, albums, artists and eras." },
@@ -989,11 +1092,11 @@ function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal,
   const visible = activeTag ? brackets.filter((item) => item.tags?.includes(activeTag)) : brackets;
   return <div className="workspace explorePage">
     <section className="exploreHero"><div><small>DISCOVER THE DEBATE</small><h1>Explore brackets made for everything.</h1><p>Find a matchup worth arguing about, follow its winner, or use it as inspiration for your own.</p></div><button onClick={onCreate}>＋ Create Bracket</button></section>
-    <section className="exploreSection"><div className="dashboardTop"><div><h2>Browse by tag</h2><p>Brackets can live in more than one lane.</p></div>{activeTag && <button className="clearTagFilter" onClick={() => setActiveTag(null)}>Show all</button>}</div><div className="categoryGrid">{categories.map((category) => <button className={`categoryCard ${activeTag === category.title ? "active" : ""}`} key={category.title} onClick={() => setActiveTag(category.title)}><i>{category.icon}</i><div><h3>{category.title}</h3><p>{category.text}</p></div></button>)}</div></section>
+    <details className="exploreSection browseTagPanel"><summary><div><h2>Browse by tag</h2><p>Open tag filters to narrow the community gallery.</p></div><span>{activeTag || "All tags"}</span></summary><div className="browseTagBody">{activeTag && <button className="clearTagFilter" onClick={() => setActiveTag(null)}>Show all</button>}<div className="categoryGrid">{categories.map((category) => <button className={`categoryCard ${activeTag === category.title ? "active" : ""}`} key={category.title} onClick={() => setActiveTag(category.title)}><i>{category.icon}</i><div><h3>{category.title}</h3><p>{category.text}</p></div></button>)}</div></div></details>
     <section className="exploreSection"><div className="dashboardTop"><div><h2>{activeTag ? `${activeTag} brackets` : "Public brackets"}</h2><p>Published brackets from the FatBrackets community.</p></div><span>{visible.length} available</span></div>
       {loading ? <div className="loadingState">Loading public brackets…</div>
         : visible.length === 0 ? <div className="exploreEmpty"><b>No brackets found here yet.</b><p>Create the first public bracket for this tag and claim the lane.</p><button onClick={onCreate}>Create the first contender</button></div>
-        : <div className="tournamentGrid exploreGrid">{visible.map((item) => <article className="tournamentCard" key={item.id}><div className="cardBracket"><span /><span /><span /><span /></div><div className="cardMeta"><span className={`statusPill ${item.status}`}>{item.status}</span><span>{item.bracket_size} contestants</span></div><h3>{item.name}</h3>{item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Cloned from {item.cloned_from_name || "original bracket"} ↗</button>}<div className="tagRow">{(item.tags ?? []).slice(0,4).map((tag) => <span key={tag}>{tag}</span>)}</div><p>Updated {new Date(item.updated_at).toLocaleDateString()}</p><div className="cardActions exploreActions"><button onClick={() => onOpen(item)}>View Bracket</button><button onClick={() => onClone(item)}>{canClone ? "Clone" : "Sign in to clone"}</button></div></article>)}</div>}
+        : <div className="tournamentGrid exploreGrid">{visible.map((item) => <article className={`tournamentCard exploreTournamentCard ${currentUserId === item.owner_id ? "ownedByMe" : "communityOwned"}`} key={item.id}><div className="ownershipRibbon">{currentUserId === item.owner_id ? "Your bracket" : "Community bracket"}</div><div className="cardBracket"><span /><span /><span /><span /></div><div className="cardMeta"><span className={`statusPill ${item.status}`}>{item.status}</span><span>{item.bracket_size} contestants</span></div><h3>{item.name}</h3>{item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Cloned from {item.cloned_from_name || "original bracket"} ↗</button>}<div className="tagRow">{(item.tags ?? []).slice(0,4).map((tag) => <span key={tag}>{tag}</span>)}</div><p>Updated {new Date(item.updated_at).toLocaleDateString()}</p><div className="cardActions exploreActions"><button onClick={() => onOpen(item)}>View Bracket</button><button onClick={() => onClone(item)}>{canClone ? "Clone" : "Sign in to clone"}</button></div></article>)}</div>}
     </section>
   </div>;
 }
@@ -1338,6 +1441,7 @@ function mergeImportedEntries(current: Contestant[], entries: ImportedEntry[]): 
 }
 
 function ManageImportPanel({ size, onImport }: { size: number; onImport: (entries: ImportedEntry[]) => void }) {
+  const [mode, setMode] = useState<"upload" | "paste">("upload");
   const [text, setText] = useState("");
   const [message, setMessage] = useState("");
   function apply(raw: string) {
@@ -1353,8 +1457,16 @@ function ManageImportPanel({ size, onImport }: { size: number; onImport: (entrie
     apply(await file.text());
   }
   return <section className="manageImportPanel">
-    <div><b>Merge contestants</b><small>Upload or paste additions and corrections. Matching names and supplied seeds are updated first; new entries fill empty slots.</small></div>
-    <div className="manageImportActions"><input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={(event) => upload(event.target.files?.[0])} /><textarea placeholder="Paste names or comma-delimited rows…" value={text} onChange={(event) => setText(event.target.value)} /><button type="button" onClick={() => apply(text)}>Merge pasted list</button></div>
+    <div className="entryImportMode" role="tablist" aria-label="Entry import method">
+      <button type="button" role="tab" aria-selected={mode === "upload"} className={mode === "upload" ? "active" : ""} onClick={() => { setMode("upload"); setMessage(""); }}>Upload file</button>
+      <button type="button" role="tab" aria-selected={mode === "paste"} className={mode === "paste" ? "active" : ""} onClick={() => { setMode("paste"); setMessage(""); }}>Paste list</button>
+    </div>
+    {mode === "upload" ? <div className="entryUploadForm">
+      <label><b>Choose a CSV or TXT file</b><small>The file is merged as soon as you select it.</small><input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={(event) => upload(event.target.files?.[0])} /></label>
+    </div> : <div className="entryPasteForm">
+      <textarea placeholder="Paste names or comma-delimited rows…" value={text} onChange={(event) => setText(event.target.value)} />
+      <button type="button" onClick={() => apply(text)}>Merge pasted list</button>
+    </div>}
     {message && <small className="importMessage">{message}</small>}
   </section>;
 }
@@ -1365,9 +1477,13 @@ function ManageBracket(props: {
   onName: (value: string) => void; onRegionNames: (names: string[]) => void; onPlayMode: (mode: PlayMode) => void; onTags: (tags: string[]) => void; onVisibility: (visibility: "private" | "public") => void; onSeedingStyle: (style: SeedingStyle) => void;
   onSelectSeed: (seed: number | null) => void; onUpdateContestant: (seed: number, patch: Partial<Contestant>) => void;
   onSwap: (fromSeed: number, toSeed: number) => void; onToggleLock: (seed: number) => void;
-  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, file: File) => void; onMergeImport: (entries: ImportedEntry[]) => void; onDelete: () => void;
+  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, source: ImageUploadPayload) => void | Promise<void>; onMergeImport: (entries: ImportedEntry[]) => void; onDelete: () => void;
   clonedFromId: string | null; clonedFromName: string | null; onOpenOriginal: (id: string) => void;
+  theme: BracketTheme; settings: AppSettings; currentUserId: string; onThemeChange: (theme: BracketTheme) => void;
 }) {
+  type ManageTab = "settings" | "entries" | "styler" | "importer";
+  const [activeTab, setActiveTab] = useState<ManageTab>("settings");
+  const [entrySearch, setEntrySearch] = useState("");
   const selected = props.contestants.find((item) => item.seed === props.selectedSeed);
   const [draggedSeed, setDraggedSeed] = useState<number | null>(null);
   const regionCount = props.size >= 32 ? props.size / 16 : 1;
@@ -1375,140 +1491,544 @@ function ManageBracket(props: {
 
   return <div className="managePage">
     <div className="manageTopbar">
-      <div><small>BRACKET ADMIN</small><input className="manageName" value={props.name} onChange={(event) => props.onName(event.target.value)} /></div>
-      <div className="manageTopActions"><SaveLabel state={props.saveState} /><button className="secondaryAction" onClick={props.onSave}>Save changes</button><button onClick={props.onOpenBracket}>Open bracket →</button></div>
+      <div><small>MANAGE BRACKET</small><input className="manageName" value={props.name} onChange={(event) => props.onName(event.target.value)} /></div>
+      <div className="manageTopActions"><button className="secondaryAction" onClick={props.onSave}>Save changes</button><SaveLabel state={props.saveState} /><button onClick={props.onOpenBracket}>Open bracket →</button></div>
     </div>
     {props.clonedFromId && <button className="manageCloneLineage" onClick={() => props.onOpenOriginal(props.clonedFromId as string)}>Cloned from {props.clonedFromName || "original bracket"} — view original ↗</button>}
 
-    <div className="manageSettingsGrid">
+    <nav className="manageTabs" aria-label="Manage bracket sections">
+      <button className={activeTab === "settings" ? "active" : ""} onClick={() => setActiveTab("settings")}><span>01</span><b>Settings</b><small>Visibility, tags, play and ranking</small></button>
+      <button className={activeTab === "entries" ? "active" : ""} onClick={() => setActiveTab("entries")}><span>02</span><b>Entries</b><small>Search, seed, edit and organize</small></button>
+      <button className={activeTab === "styler" ? "active" : ""} onClick={() => setActiveTab("styler")}><span>03</span><b>Styler</b><small>Colors, cards, lines and shared styles</small></button>
+      <button className={activeTab === "importer" ? "active" : ""} onClick={() => setActiveTab("importer")}><span>04</span><b>Importer</b><small>Upload a file or paste a list</small></button>
+    </nav>
+
+    {activeTab === "settings" && <div className="manageTabPanel manageSettingsTab">
       <section className="manageSettingsCard manageIdentityCard">
         <div className="manageSectionHeading"><span>01</span><div><b>Bracket settings</b><small>Control where this bracket appears and how it is played.</small></div></div>
-        <div className="manageFieldGrid">
+        <div className="manageFieldGrid manageSettingsTwoColumn">
           <div className="manageTagsField"><TagSelector tags={props.tags} onChange={props.onTags} compact /></div>
-          <div className="visibilityChoice compact"><div><b>Visibility</b><small>Only public brackets appear in Explore.</small></div><div><button className={props.visibility === "private" ? "chosen" : ""} onClick={() => props.onVisibility("private")}>Private</button><button className={props.visibility === "public" ? "chosen" : ""} onClick={() => props.onVisibility("public")}>Public</button></div></div>
-          <label className="managePlayMode"><span>Play mode</span><select value={props.playMode} onChange={(event) => props.onPlayMode(event.target.value as PlayMode)}><option value="manual">Manual</option><option value="voting">Voting</option><option value="random">Random</option></select></label>
+          <div className="manageSettingsRight"><div className="visibilityChoice compact"><div><b>Visibility</b><small>Only public brackets appear in Explore.</small></div><div><button className={props.visibility === "private" ? "chosen" : ""} onClick={() => props.onVisibility("private")}>Private</button><button className={props.visibility === "public" ? "chosen" : ""} onClick={() => props.onVisibility("public")}>Public</button></div></div>
+          <div className="manageSettingSelects">
+            <label className="managePlayMode"><span>Play mode</span><select value={props.playMode} onChange={(event) => props.onPlayMode(event.target.value as PlayMode)}><option value="manual">Manual</option><option value="voting">Voting</option><option value="random">Random</option></select></label>
+            <label className="managePlayMode"><span>Ranking display</span><select value={props.seedingStyle} onChange={(event) => props.onSeedingStyle(event.target.value as SeedingStyle)}><option value="seedless">Seedless — no ranking</option><option value="overall">Overall ranking</option>{props.size >= 32 && <option value="regional">Regional ranking</option>}</select></label>
+          </div></div>
         </div>
       </section>
+      <section className="dangerZone"><div><b>Delete bracket</b><p>Permanently removes the bracket, entries, matchups and votes.</p></div><button onClick={props.onDelete}>Delete bracket</button></section>
+    </div>}
 
-      <section className="manageSettingsCard manageImportCard">
-        <div className="manageSectionHeading"><span>02</span><div><b>Update contestants</b><small>Merge a file or pasted list into the existing field.</small></div></div>
-        <ManageImportPanel size={props.size} onImport={props.onMergeImport} />
-      </section>
+    {activeTab === "styler" && <div className="manageTabPanel manageStylerTab">
+      <BracketDesigner
+        theme={props.theme}
+        settings={props.settings}
+        bracketName={props.name}
+        currentUserId={props.currentUserId}
+        saveState={props.saveState}
+        onThemeChange={props.onThemeChange}
+        onSave={props.onSave}
+      />
+    </div>}
 
-    </div>
-
-    <div className="regionAdminToolbar">
-      <div><small>SEED YOUR FIELD</small><b>{regionCount === 1 ? "Contestants" : "Regions"}</b><p>Drag cards to reseed or move contestants. Lock favorites before randomizing.</p></div>
-      <div className="regionAdminTools">
-        {props.size >= 32 && <label className="compactSeedingSelect">
-          <span>Regional seeding</span>
-          <select value={props.seedingStyle} onChange={(event) => props.onSeedingStyle(event.target.value as SeedingStyle)} aria-label="Regional seeding style">
-            <option value="overall">Overall 1–{props.size}</option>
-            <option value="regional">Regional 1–16</option>
-          </select>
-        </label>}
-        <button className="secondaryAction" onClick={props.onRandomizeAll}>↝ Randomize all unlocked</button>
+    {activeTab === "entries" && <div className="manageTabPanel manageEntriesTab">
+      <div className="entrySearchBar"><span>⌕</span><input value={entrySearch} onChange={(event) => setEntrySearch(event.target.value)} placeholder="Search entries by name or details" /><small>{entrySearch ? `${props.contestants.filter((item) => `${item.name} ${item.details}`.toLowerCase().includes(entrySearch.toLowerCase())).length} matches` : `${props.contestants.filter((item) => item.name).length} filled entries`}</small>{entrySearch && <button onClick={() => setEntrySearch("")}>Clear</button>}</div>
+      <div className="regionAdminToolbar">
+        <div><small>ORGANIZE YOUR FIELD</small><b>{regionCount === 1 ? "Bracket Entries" : "Regions & Entries"}</b><p>Drag entries to reseed or move them. Lock favorites before randomizing.</p></div>
+        <div className="regionAdminTools">
+          {props.size >= 32 && <label className="compactSeedingSelect">
+            <span>Regional seeding</span>
+            <select value={props.seedingStyle} onChange={(event) => props.onSeedingStyle(event.target.value as SeedingStyle)} aria-label="Regional seeding style">
+              <option value="overall">Overall 1–{props.size}</option>
+              <option value="regional">Regional 1–16</option>
+            </select>
+          </label>}
+          <button className="secondaryAction" onClick={props.onRandomizeAll}>↝ Randomize all unlocked</button>
+        </div>
       </div>
-    </div>
 
-    <div className={`regionAdminGrid regions-${regionCount}`}>
-      {names.map((regionName, regionIndex) => {
-        const start = regionIndex * 16;
-        const entries = props.contestants.slice(start, start + (regionCount === 1 ? props.size : 16));
-        return <section className="regionAdmin" key={regionIndex}>
-          <div className="regionAdminHeader">
-            {regionCount > 1 ? <input value={regionName} onChange={(event) => props.onRegionNames(names.map((name, index) => index === regionIndex ? event.target.value : name))} /> : <h2>{regionName}</h2>}
-            <button onClick={() => regionCount === 1 ? props.onRandomizeAll() : props.onRandomizeRegion(regionIndex)}>{regionCount === 1 ? "Randomize field" : "Randomize region"}</button>
-          </div>
-          <div className="adminContestants">
-            {entries.map((contestant) => <article
-              className={`adminContestant ${contestant.locked ? "locked" : ""}`}
-              draggable
-              key={contestant.seed}
-              onDragStart={() => setDraggedSeed(contestant.seed)}
-              onDragEnd={() => setDraggedSeed(null)}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => { event.preventDefault(); if (draggedSeed) props.onSwap(draggedSeed, contestant.seed); setDraggedSeed(null); }}
-            >
-              <button className="adminCardMain" onClick={() => props.onSelectSeed(contestant.seed)}>
-                <ContestantPhoto contestant={contestant} />
-                <span className="adminSeed">{displayedSeed(contestant, props.size, props.seedingStyle)}</span>
-                <span><b>{contestant.name || `Seed ${displayedSeed(contestant, props.size, props.seedingStyle)}`}</b><small>{contestant.details || "Add details and an image"}</small></span>
-              </button>
-              <button className="lockButton" title={contestant.locked ? "Unlock seed" : "Lock seed"} onClick={() => props.onToggleLock(contestant.seed)}>{contestant.locked ? "🔒" : "○"}</button>
-            </article>)}
-          </div>
-        </section>;
-      })}
-    </div>
-    <section className="dangerZone"><div><b>Delete bracket</b><p>Permanently removes the bracket, contestants, matchups and votes.</p></div><button onClick={props.onDelete}>Delete bracket</button></section>
+      <div className={`regionAdminGrid regions-${regionCount}`}>
+        {names.map((regionName, regionIndex) => {
+          const start = regionIndex * 16;
+          const regionEntries = props.contestants.slice(start, start + (regionCount === 1 ? props.size : 16));
+          const normalizedSearch = entrySearch.trim().toLowerCase();
+          const entries = normalizedSearch ? regionEntries.filter((item) => `${item.name} ${item.shortName} ${item.details}`.toLowerCase().includes(normalizedSearch)) : regionEntries;
+          return <section className="regionAdmin" key={regionIndex}>
+            <div className="regionAdminHeader">
+              {regionCount > 1 ? <input value={regionName} onChange={(event) => props.onRegionNames(names.map((name, index) => index === regionIndex ? event.target.value : name))} /> : <h2>{regionName}</h2>}
+              <button onClick={() => regionCount === 1 ? props.onRandomizeAll() : props.onRandomizeRegion(regionIndex)}>{regionCount === 1 ? "Randomize entries" : "Randomize region"}</button>
+            </div>
+            <div className="adminContestants">
+              {entries.map((contestant) => <article
+                className={`adminContestant ${contestant.locked ? "locked" : ""}`}
+                draggable
+                key={contestant.seed}
+                onDragStart={() => setDraggedSeed(contestant.seed)}
+                onDragEnd={() => setDraggedSeed(null)}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => { event.preventDefault(); if (draggedSeed) props.onSwap(draggedSeed, contestant.seed); setDraggedSeed(null); }}
+              >
+                <button className="adminCardMain" onClick={() => props.onSelectSeed(contestant.seed)}>
+                  <ContestantPhoto contestant={contestant} />
+                  {props.seedingStyle !== "seedless" && <span className="adminSeed">{displayedSeed(contestant, props.size, props.seedingStyle)}</span>}
+                  <span><b>{contestant.name || (props.seedingStyle === "seedless" ? "Empty entry" : `Seed ${displayedSeed(contestant, props.size, props.seedingStyle)}`)}</b><small>{contestant.details || "Add details and an image"}</small></span>
+                </button>
+                <button className="lockButton" title={contestant.locked ? "Unlock seed" : "Lock seed"} onClick={() => props.onToggleLock(contestant.seed)}>{contestant.locked ? "🔒" : "○"}</button>
+              </article>)}
+            </div>
+          </section>;
+        })}
+      </div>
+    </div>}
+    {activeTab === "importer" && <div className="manageTabPanel manageImporterTab"><section className="manageImporterCard"><div className="manageSectionHeading"><span>04</span><div><b>Import or merge entries</b><small>Upload a CSV/TXT file or paste rows. Existing entries are updated by seed or matching name.</small></div></div><ManageImportPanel size={props.size} onImport={props.onMergeImport} /></section></div>}
     {selected && <ContestantDrawer contestant={selected} onClose={() => props.onSelectSeed(null)} onUpdate={props.onUpdateContestant} onUpload={props.onUploadImage} />}
   </div>;
 }
 
+type CropSource = { blob: Blob; url: string; label: string };
+
 function ContestantDrawer({ contestant, onClose, onUpdate, onUpload }: {
   contestant: Contestant; onClose: () => void; onUpdate: (seed: number, patch: Partial<Contestant>) => void;
-  onUpload?: (seed: number, file: File) => void;
+  onUpload?: (seed: number, source: ImageUploadPayload) => void | Promise<void>;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const [libraryImages, setLibraryImages] = useState<Array<{ id: string; label: string; public_url: string; usage_count: number }>>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryQuery, setLibraryQuery] = useState(contestant.name);
+  const [cropSource, setCropSource] = useState<CropSource | null>(null);
+  const [imageTask, setImageTask] = useState<"" | "pasting" | "capturing" | "fetching">("");
+
+  const searchLibrary = useCallback(async (query: string) => {
+    const normalized = query.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!normalized) { setLibraryImages([]); return; }
+    setLibraryLoading(true);
+    const terms = normalized.split(/\s+/).filter(Boolean);
+    const searchTerm = terms.join("%");
+    const { data } = await supabase.from("image_assets")
+      .select("id,label,public_url,usage_count")
+      .ilike("normalized_name", `%${searchTerm}%`)
+      .order("usage_count", { ascending: false })
+      .limit(8);
+    setLibraryImages((data ?? []) as Array<{ id: string; label: string; public_url: string; usage_count: number }>);
+    setLibraryLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => searchLibrary(libraryQuery || contestant.name), 250);
+    return () => window.clearTimeout(timer);
+  }, [libraryQuery, contestant.name, searchLibrary]);
+
+  useEffect(() => () => {
+    if (cropSource) URL.revokeObjectURL(cropSource.url);
+  }, [cropSource]);
+
+  function openCropper(blob: Blob, label: string) {
+    if (!blob.type.startsWith("image/")) {
+      window.alert("Please choose an image file.");
+      return;
+    }
+    setCropSource((current) => {
+      if (current) URL.revokeObjectURL(current.url);
+      return { blob, label, url: URL.createObjectURL(blob) };
+    });
+  }
+
   function chooseFile(file?: File) {
     if (!file || !file.type.startsWith("image/")) return;
-    onUpload?.(contestant.seed, file);
+    openCropper(file, file.name || `${contestant.name || "entry"}.png`);
+    if (inputRef.current) inputRef.current.value = "";
   }
-  return <><button className="scrim" aria-label="Close editor" onClick={onClose} /><aside>
-    <div className="asideTitle"><div><small>SEED {contestant.seed}</small><h2>Edit contestant</h2></div><button onClick={onClose}>×</button></div>
-    <div className="photo uploadPhoto" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); chooseFile(event.dataTransfer.files?.[0]); }}>
-      <i style={{ background: contestant.accentColor }}>{contestant.imageUrl ? <img src={contestant.imageUrl} alt="" /> : initials(contestant.name)}</i>
-      <div><button type="button" onClick={() => inputRef.current?.click()}>Upload photo</button><small>Choose a file or drag one here.</small><input ref={inputRef} hidden type="file" accept="image/*" onChange={(event) => chooseFile(event.target.files?.[0])} /></div>
+
+  async function pasteImageFromClipboard() {
+    if (!(navigator.clipboard as Clipboard & { read?: () => Promise<ClipboardItem[]>; }).read) {
+      window.alert("Clipboard image paste is not available in this browser.");
+      return;
+    }
+    setImageTask("pasting");
+    try {
+      const items = await (navigator.clipboard as Clipboard & { read: () => Promise<ClipboardItem[]>; }).read();
+      for (const item of items) {
+        const type = item.types.find((value) => value.startsWith("image/"));
+        if (!type) continue;
+        const blob = await item.getType(type);
+        openCropper(blob, `${contestant.name || "pasted-image"}.${type.split("/")[1] || "png"}`);
+        return;
+      }
+      window.alert("No image was found in the clipboard.");
+    } catch (error) {
+      console.error(error);
+      window.alert(error instanceof Error ? error.message : "Could not read from the clipboard.");
+    } finally {
+      setImageTask("");
+    }
+  }
+
+  async function importFromUrl() {
+    const candidate = window.prompt("Paste an image URL", contestant.imageUrl || "");
+    if (!candidate?.trim()) return;
+    setImageTask("fetching");
+    try {
+      const response = await fetch(candidate.trim());
+      if (!response.ok) throw new Error(`Could not fetch image (${response.status}).`);
+      const blob = await response.blob();
+      if (!blob.type.startsWith("image/")) throw new Error("That URL did not return an image.");
+      const pathname = (() => { try { return new URL(candidate.trim()).pathname; } catch { return "image"; } })();
+      const label = pathname.split("/").pop() || `${contestant.name || "image"}.png`;
+      openCropper(blob, label);
+    } catch (error) {
+      console.error(error);
+      window.alert(error instanceof Error ? error.message : "Could not load the image URL.");
+    } finally {
+      setImageTask("");
+    }
+  }
+
+  async function captureScreenGrab() {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      window.alert("Screen capture is not available in this browser.");
+      return;
+    }
+    setImageTask("capturing");
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.muted = true;
+      await new Promise<void>((resolve) => {
+        video.onloadedmetadata = () => resolve();
+      });
+      await video.play();
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Could not capture this screen.");
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not capture the screen.")), "image/png"));
+      openCropper(blob, `${contestant.name || "screen-capture"}.png`);
+    } catch (error) {
+      if ((error as DOMException)?.name !== "NotAllowedError") {
+        console.error(error);
+        window.alert(error instanceof Error ? error.message : "Could not capture the screen.");
+      }
+    } finally {
+      stream?.getTracks().forEach((track) => track.stop());
+      setImageTask("");
+    }
+  }
+
+  async function useLibraryImage(image: { id: string; public_url: string }) {
+    onUpdate(contestant.seed, { imageUrl: image.public_url, imageAssetId: image.id });
+    await supabase.rpc("increment_image_asset_usage", { asset_id: image.id });
+  }
+
+  return <><button className="scrim" aria-label="Close editor" onClick={onClose} /><aside className="contestantDrawer">
+    <div className="asideTitle"><div><small>SEED {contestant.seed}</small><h2>Edit entry</h2></div><button onClick={onClose}>×</button></div>
+    <div className="imageChooser">
+      <div className="photo uploadPhoto" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); chooseFile(event.dataTransfer.files?.[0]); }}>
+        <i style={{ background: contestant.accentColor }}>{contestant.imageUrl ? <img src={contestant.imageUrl} alt="" /> : initials(contestant.name)}</i>
+        <div className="imageUploadTools">
+          <div className="imageToolIntro"><b>Entry image</b><small>Upload, paste, capture or reuse an image. Every method opens the crop editor before saving.</small></div>
+          <div className="imageActionGrid">
+            <button type="button" onClick={() => inputRef.current?.click()}>Upload file</button>
+            <button type="button" onClick={pasteImageFromClipboard} disabled={imageTask !== ""}>{imageTask === "pasting" ? "Reading…" : "Paste image"}</button>
+            <button type="button" onClick={importFromUrl} disabled={imageTask !== ""}>{imageTask === "fetching" ? "Loading…" : "Image URL"}</button>
+            <button type="button" onClick={captureScreenGrab} disabled={imageTask !== ""}>{imageTask === "capturing" ? "Capturing…" : "Capture screen"}</button>
+          </div>
+          <small className="imageActionHint">Images are cropped to a square, resized to 640×640 and compressed to WebP.</small>
+          <input ref={inputRef} hidden type="file" accept="image/*" onChange={(event) => chooseFile(event.target.files?.[0])} />
+        </div>
+      </div>
+      <section className="imageLibraryPanel">
+        <div className="imageLibraryHeading"><div><b>FatBrackets images</b><small>Reuse an image already in the library.</small></div><input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="Search similar names" /></div>
+        {libraryLoading ? <p className="imageLibraryEmpty">Searching…</p> : libraryImages.length ? <div className="imageLibraryGrid">{libraryImages.map((image) => <button type="button" key={image.id} onClick={() => useLibraryImage(image)} title={`Use ${image.label}`}><img src={image.public_url} alt={image.label} /><span>{image.label}<small>Used {image.usage_count}×</small></span></button>)}</div> : <p className="imageLibraryEmpty">No similar images yet. Uploading one will add it to the reusable library.</p>}
+      </section>
     </div>
-    <label>Contestant name<input autoFocus value={contestant.name} onChange={(event) => onUpdate(contestant.seed, { name: event.target.value, shortName: contestant.shortName || event.target.value })} /></label>
+    <label>Entry name<input autoFocus value={contestant.name} onChange={(event) => { const value = event.target.value; onUpdate(contestant.seed, { name: value, shortName: contestant.shortName || value }); setLibraryQuery(value); }} /></label>
     <label>Short name<input value={contestant.shortName} onChange={(event) => onUpdate(contestant.seed, { shortName: event.target.value })} /><small>Used where bracket space is tight.</small></label>
     <label>Subtitle or details<input value={contestant.details} onChange={(event) => onUpdate(contestant.seed, { details: event.target.value })} /></label>
-    <label>Image URL<input value={contestant.imageUrl} onChange={(event) => onUpdate(contestant.seed, { imageUrl: event.target.value })} /></label>
+    <label>Image URL<input value={contestant.imageUrl} onChange={(event) => onUpdate(contestant.seed, { imageUrl: event.target.value, imageAssetId: null })} /></label>
     <div className="preview"><small>CARD PREVIEW</small><Player contestant={contestant} /></div>
-    <div className="asideActions"><button onClick={() => onUpdate(contestant.seed, { name: "", shortName: "", details: "", imageUrl: "" })}>Clear seed</button><button onClick={onClose}>Done</button></div>
+    <div className="asideActions"><button onClick={() => onUpdate(contestant.seed, { name: "", shortName: "", details: "", imageUrl: "", imageAssetId: null })}>Clear seed</button><button onClick={onClose}>Done</button></div>
+  </aside>
+  {cropSource && <ImageCropEditor source={cropSource} onClose={() => setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; })} onSave={async (payload) => { await onUpload?.(contestant.seed, payload); setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; }); }} />}
+  </>;
+}
+
+function ImageCropEditor({ source, onClose, onSave }: {
+  source: CropSource;
+  onClose: () => void;
+  onSave: (payload: { processed: ProcessedImage; label: string }) => void | Promise<void>;
+}) {
+  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
+  const [zoom, setZoom] = useState(1.15);
+  const [cropScale, setCropScale] = useState(0.72);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragState, setDragState] = useState<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [stageWidth, setStageWidth] = useState(420);
+  const stageHeight = Math.round(stageWidth * 0.72);
+
+  useEffect(() => {
+    const update = () => setStageWidth(Math.max(280, Math.min(420, window.innerWidth - 96)));
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  const cropSize = Math.round(Math.min(stageWidth, stageHeight) * cropScale);
+  const cropLeft = Math.round((stageWidth - cropSize) / 2);
+  const cropTop = Math.round((stageHeight - cropSize) / 2);
+  const baseScale = imageSize ? Math.max(cropSize / imageSize.width, cropSize / imageSize.height) : 1;
+  const effectiveScale = baseScale * zoom;
+  const drawWidth = (imageSize?.width || 1) * effectiveScale;
+  const drawHeight = (imageSize?.height || 1) * effectiveScale;
+
+  const clampOffset = useCallback((next: { x: number; y: number }, size = imageSize, scale = effectiveScale, crop = cropSize) => {
+    if (!size) return next;
+    const width = size.width * scale;
+    const height = size.height * scale;
+    const maxX = Math.max(0, (width - crop) / 2);
+    const maxY = Math.max(0, (height - crop) / 2);
+    return { x: Math.min(maxX, Math.max(-maxX, next.x)), y: Math.min(maxY, Math.max(-maxY, next.y)) };
+  }, [cropSize, effectiveScale, imageSize]);
+
+  useEffect(() => {
+    setOffset((current) => clampOffset(current));
+  }, [clampOffset, cropScale, imageSize, stageWidth, zoom]);
+
+  const imageLeft = stageWidth / 2 + offset.x - drawWidth / 2;
+  const imageTop = stageHeight / 2 + offset.y - drawHeight / 2;
+  const previewSize = 108;
+  const previewRatio = previewSize / cropSize;
+
+  async function saveCrop() {
+    if (!imageSize) return;
+    setSaving(true);
+    try {
+      const sourceX = Math.max(0, Math.min(imageSize.width, (cropLeft - imageLeft) / effectiveScale));
+      const sourceY = Math.max(0, Math.min(imageSize.height, (cropTop - imageTop) / effectiveScale));
+      const sourceSize = Math.max(1, Math.min(imageSize.width - sourceX, imageSize.height - sourceY, cropSize / effectiveScale));
+      const processed = await processCroppedContestantImage(source.blob, { x: sourceX, y: sourceY, size: sourceSize });
+      await onSave({ processed, label: source.label });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <><button className="scrim" aria-label="Close crop editor" onClick={onClose} /><aside className="contestantDrawer cropDrawer">
+    <div className="asideTitle"><div><small>IMAGE CROP</small><h2>Preview, adjust and save</h2></div><button onClick={onClose}>×</button></div>
+    <div className="cropEditorLayout">
+      <div className="cropStage" onPointerDown={(event) => { event.preventDefault(); setDragState({ pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: offset.x, originY: offset.y }); }} onPointerMove={(event) => { if (!dragState || dragState.pointerId !== event.pointerId) return; event.preventDefault(); setOffset(clampOffset({ x: dragState.originX + (event.clientX - dragState.x), y: dragState.originY + (event.clientY - dragState.y) })); }} onPointerUp={(event) => { if (dragState?.pointerId === event.pointerId) setDragState(null); }} onPointerCancel={() => setDragState(null)}>
+        <img src={source.url} alt="Crop source" draggable={false} onLoad={(event) => { const target = event.currentTarget; setImageSize({ width: target.naturalWidth, height: target.naturalHeight }); setOffset({ x: 0, y: 0 }); }} style={{ left: imageLeft, top: imageTop, width: drawWidth, height: drawHeight }} />
+        <div className="cropFrame" style={{ left: cropLeft, top: cropTop, width: cropSize, height: cropSize }} />
+      </div>
+      <div className="cropSidebar">
+        <div className="cropPreviewCard">
+          <small>FINAL CARD PREVIEW</small>
+          <div className="cropPreviewWindow">
+            <img src={source.url} alt="Cropped preview" draggable={false} style={{ left: (imageLeft - cropLeft) * previewRatio, top: (imageTop - cropTop) * previewRatio, width: drawWidth * previewRatio, height: drawHeight * previewRatio }} />
+          </div>
+        </div>
+        <label className="cropControl">
+          <span>Zoom image</span>
+          <input type="range" min={1} max={2.6} step={0.01} value={zoom} onChange={(event) => setZoom(Number(event.target.value))} />
+          <small>{Math.round(zoom * 100)}%</small>
+        </label>
+        <label className="cropControl">
+          <span>Resize crop area</span>
+          <input type="range" min={0.46} max={0.9} step={0.01} value={cropScale} onChange={(event) => setCropScale(Number(event.target.value))} />
+          <small>{Math.round(cropScale * 100)}%</small>
+        </label>
+        <p className="cropHint">Drag the image beneath the square frame. Uploads, pasted images, image URLs and screen captures all use this same crop flow.</p>
+      </div>
+    </div>
+    <div className="asideActions cropActions"><button onClick={onClose}>Cancel</button><button onClick={saveCrop} disabled={saving || !imageSize}>{saving ? "Saving…" : "Use cropped image"}</button></div>
   </aside></>;
 }
 
-
-function AdminSettings({ settings, onChange, onReset }: { settings: AppSettings; onChange: (settings: AppSettings) => void; onReset: () => void }) {
+function AdminSettings({ settings, onChange, onReset }: {
+  settings: AppSettings;
+  onChange: (settings: AppSettings) => void;
+  onReset: () => void;
+}) {
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     onChange({ ...settings, [key]: value });
   }
-
-  return <div className="workspace adminSettingsPage">
-    <div className="adminSettingsHeading"><div><small>APPLICATION CONTROL PANEL</small><h1>Admin Settings</h1><p>Tune the bracket canvas experience. Changes apply immediately and are saved in this browser.</p></div><button onClick={onReset}>Reset defaults</button></div>
-    <section className="settingsPanel">
-      <div className="settingsPanelTitle"><h2>Canvas Motion</h2><p>Control how the bracket responds when users drag and release it.</p></div>
-      <SettingSlider label="Friction" help="Higher friction stops the canvas faster." value={settings.frictionStrength} min={20} max={220} step={5} display={`${settings.frictionStrength}%`} onChange={(value) => set("frictionStrength", value)} />
-      <SettingSlider label="Momentum sensitivity" help="Controls how strongly a flick carries into the glide." value={settings.momentumSensitivity} min={0.25} max={2} step={0.05} display={`${settings.momentumSensitivity.toFixed(2)}×`} onChange={(value) => set("momentumSensitivity", value)} />
-    </section>
-    <section className="settingsPanel">
-      <div className="settingsPanelTitle"><h2>Canvas Zoom</h2><p>Set the starting zoom and the limits available to users.</p></div>
-      <SettingSlider label="Default zoom" help="Starting zoom before Fit or Center is used." value={settings.defaultZoom} min={0.3} max={1.2} step={0.01} display={`${Math.round(settings.defaultZoom * 100)}%`} onChange={(value) => set("defaultZoom", value)} />
-      <SettingSlider label="Minimum zoom" help="How far users can zoom out." value={settings.minimumZoom} min={0.1} max={0.6} step={0.01} display={`${Math.round(settings.minimumZoom * 100)}%`} onChange={(value) => set("minimumZoom", Math.min(value, settings.maximumZoom - 0.05))} />
-      <SettingSlider label="Maximum zoom" help="How far users can zoom in." value={settings.maximumZoom} min={0.7} max={2} step={0.01} display={`${Math.round(settings.maximumZoom * 100)}%`} onChange={(value) => set("maximumZoom", Math.max(value, settings.minimumZoom + 0.05))} />
-      <SettingSlider label="Double-click / double-tap zoom" help="How much closer each double-click or double-tap moves the bracket." value={settings.doubleTapZoomPercent} min={5} max={100} step={5} display={`${settings.doubleTapZoomPercent}%`} onChange={(value) => set("doubleTapZoomPercent", value)} />
-    </section>
-    <section className="settingsPanel">
-      <div className="settingsPanelTitle"><h2>Canvas Background</h2><p>Choose the canvas color, pattern, and tint behind every bracket.</p></div>
-      <label className="settingRow settingColorRow"><div><b>Background color</b><small>The base color behind the bracket.</small></div><input type="color" value={settings.canvasBackgroundColor} onChange={(event) => set("canvasBackgroundColor", event.target.value)} /><output>{settings.canvasBackgroundColor.toUpperCase()}</output></label>
-      <label className="settingRow"><div><b>Background pattern</b><small>Add a subtle guide pattern behind the bracket.</small></div><select value={settings.canvasPattern} onChange={(event) => set("canvasPattern", event.target.value as AppSettings["canvasPattern"])}><option value="grid">Grid</option><option value="dots">Dots</option><option value="crosshatch">Crosshatch</option><option value="none">None</option></select><output>{settings.canvasPattern}</output></label>
-      <SettingSlider label="Background tint" help="Adds a soft white tint over the selected background." value={settings.canvasTint} min={0} max={30} step={1} display={`${settings.canvasTint}%`} onChange={(value) => set("canvasTint", value)} />
-    </section>
-    <section className="settingsPanel">
-      <div className="settingsPanelTitle"><h2>Bracket Cards</h2><p>Adjust the amount of emphasis a matchup receives on hover.</p></div>
-      <SettingSlider label="Matchup hover size" help="The scale applied when a user hovers over a matchup." value={settings.matchupHoverScale} min={1} max={1.18} step={0.01} display={`${Math.round((settings.matchupHoverScale - 1) * 100)}% larger`} onChange={(value) => set("matchupHoverScale", value)} />
-    </section>
+  return <div className="workspace bracketStudioPage behaviorOnlyPage">
+    <header className="studioHero">
+      <div><small>FATBRACKETS APP CONTROL</small><h1>Admin Settings</h1><p>Adjust canvas movement, zoom and interaction defaults for this browser.</p></div>
+      <button className="secondaryStudioButton" onClick={onReset}>Reset behavior</button>
+    </header>
+    <div className="studioLayout behaviorOnlyLayout">
+      <main className="studioControls">
+        <StudioSection title="Canvas Motion" description="Control how the bracket responds to dragging and flicking." defaultOpen>
+          <SettingSlider label="Friction" help="Higher friction stops the canvas faster." value={settings.frictionStrength} min={20} max={220} step={5} display={`${settings.frictionStrength}%`} onChange={(value) => set("frictionStrength", value)} />
+          <SettingSlider label="Momentum sensitivity" help="Controls how strongly a flick carries into the glide." value={settings.momentumSensitivity} min={0.25} max={2} step={0.05} display={`${settings.momentumSensitivity.toFixed(2)}×`} onChange={(value) => set("momentumSensitivity", value)} />
+        </StudioSection>
+        <StudioSection title="Canvas Zoom" description="Set the starting zoom and user limits." defaultOpen>
+          <SettingSlider label="Default zoom" help="Starting zoom before Fit or Center is used." value={settings.defaultZoom} min={0.3} max={1.2} step={0.01} display={`${Math.round(settings.defaultZoom * 100)}%`} onChange={(value) => set("defaultZoom", value)} />
+          <SettingSlider label="Minimum zoom" help="How far users can zoom out." value={settings.minimumZoom} min={0.1} max={0.6} step={0.01} display={`${Math.round(settings.minimumZoom * 100)}%`} onChange={(value) => set("minimumZoom", Math.min(value, settings.maximumZoom - 0.05))} />
+          <SettingSlider label="Maximum zoom" help="How far users can zoom in." value={settings.maximumZoom} min={0.7} max={2} step={0.01} display={`${Math.round(settings.maximumZoom * 100)}%`} onChange={(value) => set("maximumZoom", Math.max(value, settings.minimumZoom + 0.05))} />
+          <SettingSlider label="Double-click / double-tap zoom" help="How much closer each double-click or double-tap moves the bracket." value={settings.doubleTapZoomPercent} min={5} max={100} step={5} display={`${settings.doubleTapZoomPercent}%`} onChange={(value) => set("doubleTapZoomPercent", value)} />
+        </StudioSection>
+        <StudioSection title="Matchup Interaction" description="Tune feedback without changing bracket logic." defaultOpen>
+          <SettingSlider label="Matchup hover size" help="The scale applied when a user hovers over a matchup." value={settings.matchupHoverScale} min={1} max={1.18} step={0.01} display={`${Math.round((settings.matchupHoverScale - 1) * 100)}% larger`} onChange={(value) => set("matchupHoverScale", value)} />
+        </StudioSection>
+      </main>
+    </div>
   </div>;
+}
+
+function BracketDesigner({ theme, settings, bracketName, currentUserId, saveState, onThemeChange, onSave }: {
+  theme: BracketTheme;
+  settings: AppSettings;
+  bracketName: string;
+  currentUserId: string;
+  saveState: SaveState;
+  onThemeChange: (theme: BracketTheme) => void;
+  onSave: () => void;
+}) {
+  const [previewDevice, setPreviewDevice] = useState<"desktop" | "mobile">("desktop");
+  const [previewSurface, setPreviewSurface] = useState<"dark" | "light">("dark");
+  const [styleName, setStyleName] = useState("");
+  const [sharedStyles, setSharedStyles] = useState<SharedBracketStyle[]>([]);
+  const [stylesLoading, setStylesLoading] = useState(true);
+  const [styleMessage, setStyleMessage] = useState("");
+  const historyRef = useRef<BracketTheme[]>([theme]);
+  const historyIndexRef = useRef(0);
+  const applyingHistoryRef = useRef(false);
+  const [, forceHistoryRender] = useState(0);
+
+  const loadSharedStyles = useCallback(async () => {
+    setStylesLoading(true);
+    const { data, error } = await supabase.from("bracket_styles")
+      .select("id,owner_id,name,theme_json,usage_count,created_at")
+      .eq("is_public", true)
+      .order("usage_count", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(30);
+    if (!error) setSharedStyles((data ?? []) as SharedBracketStyle[]);
+    setStylesLoading(false);
+  }, []);
+
+  useEffect(() => { loadSharedStyles(); }, [loadSharedStyles]);
+  useEffect(() => {
+    if (applyingHistoryRef.current) { applyingHistoryRef.current = false; return; }
+    const current = historyRef.current[historyIndexRef.current];
+    if (JSON.stringify(current) === JSON.stringify(theme)) return;
+    historyRef.current = [...historyRef.current.slice(0, historyIndexRef.current + 1), theme].slice(-40);
+    historyIndexRef.current = historyRef.current.length - 1;
+    forceHistoryRender((value) => value + 1);
+  }, [theme]);
+
+  function applyTheme(nextTheme: BracketTheme) { onThemeChange({ ...defaultBracketTheme, ...nextTheme }); }
+  function setTheme<K extends keyof BracketTheme>(key: K, value: BracketTheme[K]) { applyTheme({ ...theme, [key]: value }); }
+  function choosePreset(preset: BracketTheme["preset"]) { applyTheme({ ...defaultBracketTheme, ...themePresets[preset], preset }); }
+  function undo() { if (historyIndexRef.current <= 0) return; historyIndexRef.current -= 1; applyingHistoryRef.current = true; onThemeChange(historyRef.current[historyIndexRef.current]); forceHistoryRender((value) => value + 1); }
+  function redo() { if (historyIndexRef.current >= historyRef.current.length - 1) return; historyIndexRef.current += 1; applyingHistoryRef.current = true; onThemeChange(historyRef.current[historyIndexRef.current]); forceHistoryRender((value) => value + 1); }
+  function randomizeTheme() {
+    const palette = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899"];
+    const dark = ["#0b1220", "#15102b", "#211714", "#10201c", "#111827"];
+    const pick = <T,>(items: T[]) => items[Math.floor(Math.random() * items.length)];
+    applyTheme({ ...theme, preset: "classic", canvasBackgroundColor: pick(dark), canvasGradientEnd: pick(dark), canvasPattern: pick(["grid", "dots", "crosshatch", "none"] as const), canvasTint: Math.floor(Math.random() * 31), connectorColor: pick(palette), cardBackground: pick(dark), cardHoverBackground: pick(dark), advancedRoundCardBackground: pick(dark), selectedCardBackground: pick(dark), cardBorderColor: pick(palette), cardBorderWidth: Math.floor(Math.random() * 4) + 1, cardRadius: Math.floor(Math.random() * 25) + 4, cardShadow: Math.floor(Math.random() * 75) + 20, imageShape: pick(["rounded", "circle", "square"] as const), imageFit: pick(["cover", "contain"] as const) });
+  }
+  async function saveSharedStyle() {
+    const name = styleName.trim();
+    if (!name) { setStyleMessage("Give the style a name first."); return; }
+    setStyleMessage("Saving…");
+    const { error } = await supabase.from("bracket_styles").insert({ owner_id: currentUserId, name, theme_json: theme, is_public: true });
+    if (error) { setStyleMessage(error.message); return; }
+    setStyleName(""); setStyleMessage("Style shared with FatBrackets users."); await loadSharedStyles();
+  }
+  async function applySharedStyle(style: SharedBracketStyle) {
+    applyTheme(style.theme_json);
+    await supabase.rpc("increment_bracket_style_usage", { style_id: style.id });
+    setSharedStyles((items) => items.map((item) => item.id === style.id ? { ...item, usage_count: item.usage_count + 1 } : item));
+  }
+  async function deleteSharedStyle(style: SharedBracketStyle) {
+    if (style.owner_id !== currentUserId) return;
+    await supabase.from("bracket_styles").delete().eq("id", style.id).eq("owner_id", currentUserId);
+    setSharedStyles((items) => items.filter((item) => item.id !== style.id));
+  }
+
+  const canUndo = historyIndexRef.current > 0;
+  const canRedo = historyIndexRef.current < historyRef.current.length - 1;
+  return <section className="manageDesignerShell">
+    <header className="studioHero manageStudioHero designerCommandBar"><div className="designerCommandCopy"><small>BRACKET STYLER</small><h1>{bracketName || "New bracket"}</h1><p>Design settings belong to this bracket. Shared styles can be reused by anyone.</p></div><div className="designerCommandActions"><button type="button" disabled={!canUndo} onClick={undo}>↶ Undo</button><button type="button" disabled={!canRedo} onClick={redo}>↷ Redo</button><button type="button" className="secondaryStudioButton" onClick={() => choosePreset("classic")}>Reset design</button><button type="button" className="studioSaveButton" onClick={onSave}>Save changes</button><SaveLabel state={saveState} /></div></header>
+    <div className="studioLayout">
+      <main className="studioControls">
+        <StudioSection title="Presets & shared styles" description="Start from a built-in look or one shared by the community." defaultOpen>
+          <div className="presetGallery">{(["classic", "heavyweight", "neon", "minimal"] as BracketTheme["preset"][]).map((preset) => <button type="button" key={preset} className={theme.preset === preset ? "chosen" : ""} onClick={() => choosePreset(preset)}><i className={`presetSwatch preset-${preset}`}><span /><span /><span /></i><b>{{ classic: "Classic Tournament", heavyweight: "Heavyweight", neon: "Neon Arcade", minimal: "Minimal" }[preset]}</b></button>)}</div>
+          <div className="customStyleBar"><input value={styleName} onChange={(event) => setStyleName(event.target.value)} placeholder="Name and share this style" /><button type="button" onClick={saveSharedStyle}>Share style</button><button type="button" className="secondaryStudioButton" onClick={randomizeTheme}>Surprise me</button></div>
+          {styleMessage && <small className="styleMessage">{styleMessage}</small>}
+          <div className="sharedStyleHeader"><b>Community styles</b><small>{stylesLoading ? "Loading…" : `${sharedStyles.length} available`}</small></div>
+          {!stylesLoading && sharedStyles.length === 0 && <p className="emptySharedStyles">No shared styles yet. Yours can be the first.</p>}
+          {sharedStyles.length > 0 && <div className="sharedStyleGrid">{sharedStyles.map((style) => <article key={style.id}><button type="button" className="sharedStyleApply" onClick={() => applySharedStyle(style)}><i style={{ background: `linear-gradient(135deg, ${style.theme_json.cardBackground}, ${style.theme_json.connectorColor})` }} /><span><b>{style.name}</b><small>Used {style.usage_count} times</small></span></button>{style.owner_id === currentUserId && <button type="button" className="sharedStyleDelete" onClick={() => deleteSharedStyle(style)} aria-label={`Delete ${style.name}`}>×</button>}</article>)}</div>}
+        </StudioSection>
+        <StudioSection title="Canvas" description="Set the color, pattern and atmosphere behind the bracket.">
+          <div className="studioFieldGrid">
+            <StudioColor label="Canvas color" value={theme.canvasBackgroundColor} onChange={(value) => setTheme("canvasBackgroundColor", value)} />
+            <StudioColor label="Gradient color" value={theme.canvasGradientEnd} onChange={(value) => setTheme("canvasGradientEnd", value)} />
+          </div>
+          <label className="studioCompactField"><span>Background pattern</span><div className="segmentedControl patternChoices">{(["grid", "dots", "crosshatch", "none"] as const).map((value) => <button type="button" className={theme.canvasPattern === value ? "active" : ""} onClick={() => setTheme("canvasPattern", value)} key={value}>{value === "none" ? "None" : value}</button>)}</div></label>
+          <SettingSlider label="Pattern tint" help="Lightens the pattern overlay without changing the canvas colors." value={theme.canvasTint} min={0} max={50} step={1} display={`${theme.canvasTint}%`} onChange={(value) => setTheme("canvasTint", value)} />
+          <label className="studioToggleField"><span><b>Region axis bars</b><small>Show divider lines between bracket regions.</small></span><input type="checkbox" checked={theme.showRegionAxes} onChange={(event) => setTheme("showRegionAxes", event.target.checked)} /></label>
+        </StudioSection>
+        <StudioSection title="Bracket Lines" description="Make the paths subtle, loud, clean or proudly fat."><div className="studioFieldGrid"><StudioColor label="Line color" value={theme.connectorColor} onChange={(value) => setTheme("connectorColor", value)} /><label className="studioCompactField"><span>Line style</span><div className="segmentedControl">{(["solid", "dashed", "dotted"] as const).map((value) => <button type="button" className={theme.connectorStyle === value ? "active" : ""} onClick={() => setTheme("connectorStyle", value)} key={value}>{value}</button>)}</div></label></div><SettingSlider label="Line thickness" help="Controls the weight of every bracket connector." value={theme.connectorWidth} min={1} max={10} step={1} display={`${theme.connectorWidth}px`} onChange={(value) => setTheme("connectorWidth", value)} /></StudioSection>
+        <StudioSection title="Matchup Cards" description="Style each card according to what is happening inside it."><div className="studioFieldGrid"><StudioColor label="Empty slot color" value={theme.advancedRoundCardBackground} onChange={(value) => setTheme("advancedRoundCardBackground", value)} /><StudioColor label="Filled slot color" value={theme.cardBackground} onChange={(value) => setTheme("cardBackground", value)} /><StudioColor label="Filled slot hover" value={theme.cardHoverBackground} onChange={(value) => setTheme("cardHoverBackground", value)} /><StudioColor label="Selected winner color" value={theme.selectedCardBackground} onChange={(value) => setTheme("selectedCardBackground", value)} /><StudioColor label="Border color" value={theme.cardBorderColor} onChange={(value) => setTheme("cardBorderColor", value)} /></div><SettingSlider label="Border width" help="Thickness of the matchup outline." value={theme.cardBorderWidth} min={0} max={6} step={1} display={`${theme.cardBorderWidth}px`} onChange={(value) => setTheme("cardBorderWidth", value)} /><SettingSlider label="Corner radius" help="Move from square cards to pill-like cards." value={theme.cardRadius} min={0} max={30} step={1} display={`${theme.cardRadius}px`} onChange={(value) => setTheme("cardRadius", value)} /><SettingSlider label="Shadow strength" help="Adds depth behind matchup cards." value={theme.cardShadow} min={0} max={100} step={5} display={`${theme.cardShadow}%`} onChange={(value) => setTheme("cardShadow", value)} /><div className="winnerMarkControls"><label className="studioCompactField"><span>Winner badge</span><div className="segmentedControl winnerMarkChoices">{(["star", "crown", "trophy", "bolt", "none"] as const).map((value) => <button type="button" className={theme.winnerMark === value ? "active" : ""} onClick={() => setTheme("winnerMark", value)} key={value}>{value === "star" ? "★ Star" : value === "crown" ? "♛ Crown" : value === "trophy" ? "🏆 Trophy" : value === "bolt" ? "⚡ Bolt" : "None"}</button>)}</div></label><StudioColor label="Winner badge color" value={theme.winnerMarkColor} onChange={(value) => setTheme("winnerMarkColor", value)} /></div></StudioSection>
+        <StudioSection title="Images" description="Choose how contestant art sits inside every card."><div className="visualChoiceGrid">{(["rounded", "circle", "square"] as const).map((value) => <button type="button" className={theme.imageShape === value ? "chosen" : ""} onClick={() => setTheme("imageShape", value)} key={value}><i className={`shapeDemo ${value}`} /><b>{value}</b></button>)}</div><label className="studioCompactField"><span>Image fit</span><div className="segmentedControl"><button type="button" className={theme.imageFit === "cover" ? "active" : ""} onClick={() => setTheme("imageFit", "cover")}>Cover</button><button type="button" className={theme.imageFit === "contain" ? "active" : ""} onClick={() => setTheme("imageFit", "contain")}>Contain</button></div></label></StudioSection>
+      </main>
+      <aside className="studioPreviewColumn"><div className="previewToolbar"><div className="segmentedControl"><button type="button" className={previewDevice === "desktop" ? "active" : ""} onClick={() => setPreviewDevice("desktop")}>Desktop</button><button type="button" className={previewDevice === "mobile" ? "active" : ""} onClick={() => setPreviewDevice("mobile")}>Mobile</button></div><button type="button" className="surfaceToggle" onClick={() => setPreviewSurface(previewSurface === "dark" ? "light" : "dark")}>{previewSurface === "dark" ? "Light surround" : "Dark surround"}</button></div><BracketStudioPreview theme={theme} settings={settings} device={previewDevice} surface={previewSurface} /></aside>
+    </div>
+  </section>;
+}
+
+function StudioSection({ title, description, defaultOpen = false, children }: { title: string; description: string; defaultOpen?: boolean; children: ReactNode }) {
+  return <details className="studioSection" open={defaultOpen}><summary><span><b>{title}</b><small>{description}</small></span><i>+</i></summary><div className="studioSectionBody">{children}</div></details>;
+}
+
+function StudioColor({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  return <label className="studioColorField"><span>{label}</span><div><input type="color" value={value} onInput={(event) => onChange((event.target as HTMLInputElement).value)} onChange={(event) => onChange(event.target.value)} /><code>{value.toUpperCase()}</code></div></label>;
+}
+
+function BracketStudioPreview({ theme, settings, device, surface }: { theme: BracketTheme; settings: AppSettings; device: "desktop" | "mobile"; surface: "dark" | "light" }) {
+  const style = {
+    "--studio-canvas": theme.canvasBackgroundColor,
+    "--studio-gradient": theme.canvasGradientEnd,
+    "--studio-line": theme.connectorColor,
+    "--studio-line-width": `${theme.connectorWidth}px`,
+    "--studio-card": theme.cardBackground,
+    "--studio-card-hover": theme.cardHoverBackground,
+    "--studio-empty-card": theme.advancedRoundCardBackground,
+    "--studio-selected-card": theme.selectedCardBackground,
+    "--studio-winner-mark": theme.winnerMarkColor,
+    "--studio-border": theme.cardBorderColor,
+    "--studio-border-width": `${theme.cardBorderWidth}px`,
+    "--studio-radius": `${theme.cardRadius}px`,
+    "--studio-shadow": `${theme.cardShadow / 100}`,
+  } as CSSProperties;
+  return <div className={`studioPreviewShell ${surface} ${device}`}><div className={`studioMiniBracket pattern-${theme.canvasPattern} image-${theme.imageShape}`} style={{ ...style, "--studio-tint": theme.canvasTint / 100 } as CSSProperties}>
+    <div className="miniRound miniRoundOne"><MiniMatchup first="Blue Moon" second="Golden Hour" selected /><MiniMatchup first="Electric Love" second="Midnight Rain" /></div>
+    <svg className={`miniConnectors ${theme.connectorStyle}`} viewBox="0 0 420 430" preserveAspectRatio="none"><path d="M146 90 H205 V195 H274" /><path d="M146 250 H205 V195" /></svg>
+    <div className="miniRound miniFinal"><MiniMatchup first="Blue Moon" second={null} /></div>
+    <div className={`miniChampion mark-${theme.winnerMark}`}><span>{theme.winnerMark === "star" ? "★" : theme.winnerMark === "crown" ? "♛" : theme.winnerMark === "trophy" ? "🏆" : theme.winnerMark === "bolt" ? "⚡" : ""}</span><b>Blue Moon</b><small>Champion</small></div>
+  </div></div>;
+}
+
+function MiniMatchup({ first, second, selected = false }: { first: string | null; second: string | null; selected?: boolean }) {
+  const slot = (name: string | null, seed: string) => name
+    ? <div className={selected && seed === "1" ? "selected" : ""}><i>{name.slice(0, 1)}</i><span><b>{name}</b><small>{seed}</small></span></div>
+    : <div className="empty"><i>?</i><span><b>Winner TBD</b><small>—</small></span></div>;
+  return <div className="miniMatchup">{slot(first, "1")}{slot(second, "8")}</div>;
 }
 
 function SettingSlider({ label, help, value, min, max, step, display, onChange }: { label: string; help: string; value: number; min: number; max: number; step: number; display: string; onChange: (value: number) => void }) {
   return <label className="settingRow"><div><b>{label}</b><small>{help}</small></div><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /><output>{display}</output></label>;
 }
 
-function Bracket({ tournamentId, contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, editable, participants, onSave, onClear, onEdit, onWinner }: {
-  tournamentId: string | null; contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; editable: boolean;
+function Bracket({ tournamentId, contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, theme, editable, participants, onSave, onClear, onEdit, onWinner }: {
+  tournamentId: string | null; contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; theme: BracketTheme; editable: boolean;
   participants: (round: number, match: number) => Array<Contestant | null>; onSave: () => void; onClear: () => void; onEdit: () => void;
   onWinner: (round: number, match: number, contestant: Contestant) => void;
 }) {
@@ -1746,19 +2266,41 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
   }, [finalStageBounds, fitBounds, leaveNextMatchupMode]);
 
   const nextMatchup = useMemo(() => {
-    const candidates: Array<{ round: number; match: number; seed: number }> = [];
     for (let round = 1; round <= rounds; round++) {
       const count = size / 2 ** round;
+      const sideCount = round === rounds ? count : count / 2;
+      const candidates: Array<{ round: number; match: number; seed: number; side: "left" | "right" | "center"; y: number }> = [];
+
       for (let match = 0; match < count; match++) {
         const options = participants(round, match);
-        if (options[0] && options[1] && !winners[matchKey(round, match)]) {
-          candidates.push({ round, match, seed: Math.min(displayedSeed(options[0], size, seedingStyle), displayedSeed(options[1], size, seedingStyle)) });
-        }
+        if (!options[0] || !options[1] || winners[matchKey(round, match)]) continue;
+
+        const side = round === rounds ? "center" : match < sideCount ? "left" : "right";
+        const center = side === "center" ? { y: centerY } : matchCenters.get(`${side}-${round}-${match}`);
+        candidates.push({
+          round,
+          match,
+          seed: Math.min(displayedSeed(options[0], size, seedingStyle), displayedSeed(options[1], size, seedingStyle)),
+          side,
+          y: center?.y ?? centerY,
+        });
       }
-      if (candidates.length) break;
+
+      if (candidates.length) {
+        return candidates.sort((a, b) => {
+          const sideOrder = { left: 0, right: 1, center: 2 } as const;
+          return sideOrder[a.side] - sideOrder[b.side] || a.y - b.y || a.seed - b.seed || a.match - b.match;
+        })[0];
+      }
     }
-    return candidates.sort((a, b) => a.seed - b.seed || a.match - b.match)[0] ?? null;
-  }, [participants, rounds, seedingStyle, size, winners]);
+    return null;
+  }, [centerY, matchCenters, participants, rounds, seedingStyle, size, winners]);
+
+  const getNextMatchupCenter = useCallback(() => {
+    if (!nextMatchup) return null;
+    if (nextMatchup.round === rounds) return { x: centerX, y: centerY };
+    return matchCenters.get(`${nextMatchup.side}-${nextMatchup.round}-${nextMatchup.match}`) ?? null;
+  }, [centerX, centerY, matchCenters, nextMatchup, rounds]);
 
   const focusNextMatchup = useCallback(() => {
     if (!nextMatchup) {
@@ -1766,17 +2308,43 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
       return;
     }
     if (nextMatchup.round === rounds) {
-      fitBounds({ minX: centerX - 250, minY: centerY - 255, maxX: centerX + 250, maxY: centerY + 255 });
+      fitBounds({ minX: centerX - 360, minY: centerY - 330, maxX: centerX + 360, maxY: centerY + 330 });
       return;
     }
-    const totalCount = size / 2 ** nextMatchup.round;
-    const sideCount = totalCount / 2;
-    const side = nextMatchup.match < sideCount ? "left" : "right";
-    const center = matchCenters.get(`${side}-${nextMatchup.round}-${nextMatchup.match}`);
-    if (!center) return;
+
+    const current = getNextMatchupCenter();
+    if (!current || nextMatchup.side === "center") return;
+    const points = [current];
+
+    const sameRoundCount = size / 2 ** nextMatchup.round;
+    const sideCount = sameRoundCount / 2;
+    const sideStart = nextMatchup.side === "left" ? 0 : sideCount;
+    const localMatch = nextMatchup.match - sideStart;
+    if (localMatch > 0) {
+      const above = matchCenters.get(`${nextMatchup.side}-${nextMatchup.round}-${nextMatchup.match - 1}`);
+      if (above) points.push(above);
+    } else {
+      // Preserve the same amount of vertical context for the top matchup.
+      points.push({ x: current.x, y: current.y - rowGap });
+    }
+
+    if (nextMatchup.round < sideRounds) {
+      const parentCount = size / 2 ** (nextMatchup.round + 2);
+      const parentOffset = nextMatchup.side === "left" ? 0 : parentCount;
+      const parentMatch = parentOffset + Math.floor(localMatch / 2);
+      const parent = matchCenters.get(`${nextMatchup.side}-${nextMatchup.round + 1}-${parentMatch}`);
+      if (parent) points.push(parent);
+    } else {
+      points.push({ x: centerX, y: nextMatchup.side === "left" ? centerY - 160 : centerY + 160 });
+    }
+
+    const minX = Math.min(...points.map((point) => point.x)) - cardWidth / 2 - 42;
+    const maxX = Math.max(...points.map((point) => point.x)) + cardWidth / 2 + 42;
+    const minY = Math.min(...points.map((point) => point.y)) - matchupHeight / 2 - 42;
+    const maxY = Math.max(...points.map((point) => point.y)) + matchupHeight / 2 + 42;
     setSelectedRegion("next");
-    fitBounds({ minX: center.x - cardWidth / 2 - 28, minY: center.y - matchupHeight / 2 - 54, maxX: center.x + cardWidth / 2 + 28, maxY: center.y + matchupHeight / 2 + 28 });
-  }, [cardWidth, centerX, centerY, fitBounds, fitFinalStage, matchCenters, matchupHeight, nextMatchup, rounds, size]);
+    fitBounds({ minX, minY, maxX, maxY });
+  }, [cardWidth, centerX, centerY, fitBounds, fitFinalStage, getNextMatchupCenter, matchCenters, matchupHeight, nextMatchup, rounds, rowGap, sideRounds, size]);
 
   const regionSeparatorYs = useMemo(() => {
     if (regionCount <= 2) return [];
@@ -1810,6 +2378,12 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
     else if (selectedRegion === "next") setSelectedRegion("full");
   }
 
+  function selectMatchupWinner(round: number, match: number, contestant: Contestant) {
+    const isCurrentNextMatchup = nextMatchup?.round === round && nextMatchup?.match === match;
+    if (nextMatchupMode && !isCurrentNextMatchup) setNextMode(false);
+    onWinner(round, match, contestant);
+  }
+
   function zoomBy(amount: number, originX?: number, originY?: number) {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -1822,8 +2396,9 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
     const worldX = (localX - pan.x) / scale;
     const worldY = (localY - pan.y) / scale;
     stopMomentum();
+    const nextPan = clampPan({ x: localX - worldX * nextScale, y: localY - worldY * nextScale }, nextScale);
     updateScale(nextScale);
-    updatePan({ x: localX - worldX * nextScale, y: localY - worldY * nextScale });
+    updatePan(nextPan, nextScale);
   }
 
   function zoomInAtPoint(clientX: number, clientY: number) {
@@ -1838,11 +2413,12 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
     const worldX = (localX - panRef.current.x) / currentScale;
     const worldY = (localY - panRef.current.y) / currentScale;
     stopMomentum();
-    updateScale(nextScale);
-    updatePan({
+    const nextPan = clampPan({
       x: localX - worldX * nextScale,
       y: localY - worldY * nextScale,
-    });
+    }, nextScale);
+    updateScale(nextScale);
+    updatePan(nextPan, nextScale);
   }
 
   function pointerPair() {
@@ -1919,12 +2495,13 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
         settings.maximumZoom,
         Math.max(settings.minimumZoom, pinchRef.current.startScale * (distance / pinchRef.current.startDistance)),
       );
-      updateScale(nextScale);
-      updatePan({
+      const nextPan = clampPan({
         x: midpointX - pinchRef.current.worldX * nextScale,
         y: midpointY - pinchRef.current.worldY * nextScale,
-      });
-      return;
+      }, nextScale);
+      updateScale(nextScale);
+      updatePan(nextPan, nextScale);
+        return;
     }
 
     const drag = dragRef.current;
@@ -1938,7 +2515,10 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
     drag.lastX = event.clientX;
     drag.lastY = event.clientY;
     drag.lastTime = now;
-    updatePan({ x: drag.startX + event.clientX - drag.x, y: drag.startY + event.clientY - drag.y });
+    const dragDistance = Math.hypot(event.clientX - drag.x, event.clientY - drag.y);
+    if (nextMatchupMode && dragDistance > 50) setNextMode(false);
+    const nextPan = clampPan({ x: drag.startX + event.clientX - drag.x, y: drag.startY + event.clientY - drag.y });
+    updatePan(nextPan);
   }
 
   function stopDragging(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2003,7 +2583,7 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
   const roundLabel = (round: number) => round === sideRounds ? "Semifinal" : round === 1 ? `Round of ${size}` : `Round of ${size / 2 ** (round - 1)}`;
   const finalistY = [centerY - 160, centerY + 160];
 
-  return <div className="bracketPage canvasPage" style={{ "--matchup-hover-scale": settings.matchupHoverScale } as CSSProperties}>
+  return <div className={`bracketPage canvasPage theme-${theme.preset} image-${theme.imageShape}`} style={{ "--matchup-hover-scale": settings.matchupHoverScale, "--theme-gradient": theme.canvasGradientEnd, "--connector-color": theme.connectorColor, "--connector-width": `${theme.connectorWidth}px`, "--connector-dash": theme.connectorStyle === "dashed" ? "12 9" : theme.connectorStyle === "dotted" ? "2 8" : "none", "--card-bg": theme.cardBackground, "--advanced-card-bg": theme.advancedRoundCardBackground, "--card-hover-bg": theme.cardHoverBackground, "--winner-mark-color": theme.winnerMarkColor, "--card-border": theme.cardBorderColor, "--card-border-width": `${theme.cardBorderWidth}px`, "--card-radius": `${theme.cardRadius}px`, "--card-shadow-alpha": theme.cardShadow / 100, "--image-fit": theme.imageFit } as CSSProperties}>
     <div className="bracketHeading canvasHeading">
       <div className="canvasTitle">
         <h1>{name}</h1>
@@ -2017,8 +2597,8 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
       </div>
     </div>
     <div
-      className={`bracketViewport pattern-${settings.canvasPattern}`}
-      style={{ "--canvas-bg": settings.canvasBackgroundColor, "--canvas-tint": settings.canvasTint / 100 } as CSSProperties}
+      className={`bracketViewport pattern-${theme.canvasPattern}`}
+      style={{ "--canvas-bg": theme.canvasBackgroundColor, "--canvas-tint": theme.canvasTint / 100 } as CSSProperties}
       ref={viewportRef}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -2060,7 +2640,7 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
         <button onClick={fitCanvas}>Center</button>
       </div>
       <div className="bracketCanvas" style={{ width: canvasWidth, height: canvasHeight, transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}>
-        {regionCount > 0 && <div className="regionAxes" aria-hidden="true"><i className="regionAxis vertical" style={{ left: centerX }} />{regionSeparatorYs.map((axisY, index) => <i className="regionAxis horizontal" style={{ top: axisY }} key={index} />)}</div>}
+        {theme.showRegionAxes && regionCount > 0 && <div className="regionAxes" aria-hidden="true"><i className="regionAxis vertical" style={{ left: centerX }} />{regionSeparatorYs.map((axisY, index) => <i className="regionAxis horizontal" style={{ top: axisY }} key={index} />)}</div>}
         <svg className="bracketConnectors" width={canvasWidth} height={canvasHeight} aria-hidden="true">
           {(["left", "right"] as const).flatMap((side) => {
             const paths: ReactNode[] = [];
@@ -2117,9 +2697,9 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
                 width={cardWidth}
                 options={participants(round, match)}
                 winnerId={winners[matchKey(round, match)]}
-                seedLabel={(item) => displayedSeed(item, size, seedingStyle)}
+                seedLabel={(item) => seedingStyle === "seedless" ? null : displayedSeed(item, size, seedingStyle)}
                 editable={editable}
-                onWinner={(item) => onWinner(round, match, item)}
+                onWinner={(item) => selectMatchupWinner(round, match, item)}
               />;
             })}
           </section>;
@@ -2127,48 +2707,49 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
 
         <div className="finalStage" style={{ left: centerX - cardWidth / 2, top: finalistY[0] - 54 }}>
           <h2>Finalist</h2>
-          <FinalistCard editable={editable} seedLabel={(item) => displayedSeed(item, size, seedingStyle)} contestant={finalists[0]} selected={championId === finalists[0]?.id} onClick={() => finalists[0] && onWinner(rounds, 0, finalists[0])} />
+          <FinalistCard editable={editable} seedLabel={(item) => seedingStyle === "seedless" ? null : displayedSeed(item, size, seedingStyle)} contestant={finalists[0]} selected={championId === finalists[0]?.id} onClick={() => finalists[0] && selectMatchupWinner(rounds, 0, finalists[0])} />
         </div>
         <div className="finalStage bottom" style={{ left: centerX - cardWidth / 2, top: finalistY[1] - 54 }}>
-          <FinalistCard editable={editable} seedLabel={(item) => displayedSeed(item, size, seedingStyle)} contestant={finalists[1]} selected={championId === finalists[1]?.id} onClick={() => finalists[1] && onWinner(rounds, 0, finalists[1])} />
+          <FinalistCard editable={editable} seedLabel={(item) => seedingStyle === "seedless" ? null : displayedSeed(item, size, seedingStyle)} contestant={finalists[1]} selected={championId === finalists[1]?.id} onClick={() => finalists[1] && selectMatchupWinner(rounds, 0, finalists[1])} />
           <h2>Finalist</h2>
         </div>
-        <ChampionCard seedLabel={(item) => displayedSeed(item, size, seedingStyle)} contestant={champion} left={centerX - 170} top={centerY - 82} />
+        <ChampionCard seedLabel={(item) => seedingStyle === "seedless" ? null : displayedSeed(item, size, seedingStyle)} contestant={champion} left={centerX - 170} top={centerY - 82} winnerMark={theme.winnerMark} />
       </div>
     </div>
   </div>;
 }
 
 function MatchupCard({ options, winnerId, seedLabel, editable, onWinner, top, width }: {
-  options: Array<Contestant | null>; winnerId?: string; seedLabel: (item: Contestant) => number; editable: boolean; onWinner: (item: Contestant) => void; top: number; width: number;
+  options: Array<Contestant | null>; winnerId?: string; seedLabel: (item: Contestant) => number | null; editable: boolean; onWinner: (item: Contestant) => void; top: number; width: number;
 }) {
   return <div className="canvasMatchup" style={{ top, width }}>
     {options.map((item, slot) => item ? <button disabled={!editable} className={`${winnerId === item.id ? "winner" : ""} ${!editable ? "readOnly" : ""}`} key={item.id ?? item.seed} onClick={() => editable && onWinner(item)}>
       <ContestantPhoto contestant={item} />
-      <span className="seedBadge">{seedLabel(item)}</span>
+      {seedLabel(item) !== null && <span className="seedBadge">{seedLabel(item)}</span>}
       <span className="contestantCopy"><b>{item.shortName || item.name}</b><small>{item.details || (editable ? "Click to advance" : "View contestant")}</small></span>
       <em>{winnerId === item.id ? "✓" : "›"}</em>
     </button> : <div className="canvasTbd" key={slot}><span>?</span><div><b>Winner TBD</b><small>Complete the previous matchup</small></div></div>)}
   </div>;
 }
 
-function FinalistCard({ contestant, selected, seedLabel, editable, onClick }: { contestant: Contestant | null; selected: boolean; seedLabel: (item: Contestant) => number; editable: boolean; onClick: () => void }) {
+function FinalistCard({ contestant, selected, seedLabel, editable, onClick }: { contestant: Contestant | null; selected: boolean; seedLabel: (item: Contestant) => number | null; editable: boolean; onClick: () => void }) {
   return contestant ? <button disabled={!editable} className={`finalistCard ${selected ? "winner" : ""} ${!editable ? "readOnly" : ""}`} onClick={() => editable && onClick()}>
     <ContestantPhoto contestant={contestant} />
-    <span className="seedBadge">{seedLabel(contestant)}</span>
+    {seedLabel(contestant) !== null && <span className="seedBadge">{seedLabel(contestant)}</span>}
     <span className="contestantCopy"><b>{contestant.name}</b><small>{contestant.details || "Choose as champion"}</small></span>
     <em>{selected ? "✓" : "›"}</em>
   </button> : <div className="finalistCard canvasTbd"><span>?</span><div><b>Finalist TBD</b><small>Complete the semifinal</small></div></div>;
 }
 
-function ChampionCard({ contestant, left, top, seedLabel }: { contestant?: Contestant; left: number; top: number; seedLabel: (item: Contestant) => number }) {
+function ChampionCard({ contestant, left, top, seedLabel, winnerMark }: { contestant?: Contestant; left: number; top: number; seedLabel: (item: Contestant) => number | null; winnerMark: BracketTheme["winnerMark"] }) {
+  const mark = winnerMark === "star" ? "★" : winnerMark === "crown" ? "♛" : winnerMark === "trophy" ? "🏆" : winnerMark === "bolt" ? "⚡" : "";
   return <section className={`centerChampion ${contestant ? "ready" : ""}`} style={{ left, top }}>
-    <div className="championCrown">★</div>
+    {winnerMark !== "none" && <div className={`championCrown mark-${winnerMark}`}>{mark}</div>}
     {contestant ? <>
       <ContestantPhoto contestant={contestant} large />
       <small>FATBRACKETS CHAMPION</small>
       <h2>{contestant.name}</h2>
-      <p>Seed #{seedLabel(contestant)}</p>
+      {seedLabel(contestant) !== null && <p>Seed #{seedLabel(contestant)}</p>}
     </> : <><div className="emptyChampion">?</div><small>AWAITING A WINNER</small><h2>Your champion</h2><p>Choose the winner of the final.</p></>}
   </section>;
 }
@@ -2204,5 +2785,5 @@ function PlayModeCard({ title, text, chosen, onClick }: { title: string; text: s
   return <button type="button" className={chosen ? "chosen" : ""} onClick={onClick}><b>{title}</b><small>{text}</small></button>;
 }
 function Player({ contestant, onClick }: { contestant: Contestant; onClick?: () => void }) {
-  return <button className={`player ${!contestant.name ? "emptyPlayer" : ""}`} onClick={onClick}><span>{contestant.seed}</span><i style={{ background: contestant.name ? contestant.accentColor : "#e8ecf2" }}>{contestant.imageUrl ? <img src={contestant.imageUrl} alt="" /> : initials(contestant.name)}</i><b>{contestant.name || `Add seed ${contestant.seed}`}<small>{contestant.details || (contestant.name ? "No details yet" : "Click to add contestant")}</small></b><em>•••</em></button>;
+  return <button className={`player ${!contestant.name ? "emptyPlayer" : ""}`} onClick={onClick}><span>{contestant.seed}</span><i style={{ background: contestant.name ? contestant.accentColor : "#e8ecf2" }}>{contestant.imageUrl ? <img src={contestant.imageUrl} alt="" /> : initials(contestant.name)}</i><b>{contestant.name || `Add seed ${contestant.seed}`}<small>{contestant.details || (contestant.name ? "No details yet" : "Click to add entry")}</small></b><em>•••</em></button>;
 }

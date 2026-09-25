@@ -17,8 +17,26 @@ const primaryTags = ["Music", "Movies & TV", "Sports", "Food", "Games", "People"
 const nextMatchupModeKey = "fatbrackets:next-matchup-mode";
 const lastBracketKey = "fatbrackets:last-open-bracket";
 
-type View = "dashboard" | "explore" | "builder" | "manage" | "bracket" | "admin";
+type View = "dashboard" | "explore" | "builder" | "manage" | "bracket" | "admin" | "profile" | "public-profile";
 type SaveState = "idle" | "saving" | "saved" | "error";
+type UserProfile = {
+  id: string;
+  display_name: string;
+  first_name: string;
+  last_name: string;
+  location: string;
+  bio: string;
+  avatar_url: string;
+};
+type BracketSubmission = {
+  id?: string;
+  tournament_id: string;
+  user_id: string;
+  picks: WinnerMap;
+  champion_id: string | null;
+  submitted_at: string;
+  updated_at?: string;
+};
 type Tournament = {
   id: string;
   owner_id: string;
@@ -219,6 +237,419 @@ function matchKey(round: number, match: number) {
   return `${round}-${match}`;
 }
 
+type ShareLayout = "bracket" | "spotlight";
+type ShareFormat = "social" | "square";
+
+function shareDimensions(format: ShareFormat) {
+  return format === "square" ? { width: 1080, height: 1080 } : { width: 1200, height: 630 };
+}
+
+function shareUrl(slug: string, tournamentId: string | null) {
+  const key = slug || tournamentId || "";
+  if (typeof window === "undefined") return key;
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return `${window.location.origin}/?bracket=${encodeURIComponent(key)}`;
+  }
+  return `${window.location.origin}/share/${encodeURIComponent(key)}`;
+}
+
+const shareImageCache = new Map<string, Promise<HTMLImageElement | null>>();
+const shareObjectUrls = new Set<string>();
+
+function sniffImageMime(bytes: Uint8Array, declaredType = "") {
+  const declared = declaredType.toLowerCase().split(";")[0].trim();
+  if (declared.startsWith("image/")) return declared;
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP") return "image/webp";
+  if (bytes.length >= 6) {
+    const sig = String.fromCharCode(...bytes.slice(0, 6));
+    if (sig === "GIF87a" || sig === "GIF89a") return "image/gif";
+  }
+  if (bytes.length >= 12) {
+    const brand = String.fromCharCode(...bytes.slice(4, 12));
+    if (brand.includes("ftypavif") || brand.includes("ftypavis")) return "image/avif";
+  }
+  return "";
+}
+
+async function responseToImageBlob(response: Response) {
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const mime = sniffImageMime(bytes, response.headers.get("content-type") || "");
+  if (!mime) throw new Error("The image host did not return an image.");
+  return new Blob([buffer], { type: mime });
+}
+
+async function loadCanvasImage(url: string) {
+  if (!url) return null;
+  if (shareImageCache.has(url)) return shareImageCache.get(url) as Promise<HTMLImageElement | null>;
+
+  const promise = (async () => {
+    const loadImageElement = (source: string, useCors: boolean) => new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      if (useCors) image.crossOrigin = "anonymous";
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Image could not be loaded."));
+      image.src = source;
+    });
+
+    // Keep the path that already works in the live bracket. If the host supplies
+    // CORS headers, this is both the fastest and most reliable canvas source.
+    try {
+      return await loadImageElement(url, /^https?:\/\//i.test(url));
+    } catch (directError) {
+      if (!/^https?:\/\//i.test(url)) {
+        console.warn("Share image could not be loaded", url, directError);
+        return null;
+      }
+    }
+
+    // Only stubborn remote images go through FatBrackets. Converting the proxy
+    // response into a same-origin object URL avoids canvas tainting without
+    // forcing every working image through the proxy.
+    try {
+      const response = await fetch(`/api/image-proxy?url=${encodeURIComponent(url)}`, { cache: "force-cache" });
+      if (!response.ok) throw new Error(`Image proxy failed (${response.status}).`);
+      const blob = await responseToImageBlob(response);
+      const objectUrl = URL.createObjectURL(blob);
+      shareObjectUrls.add(objectUrl);
+      return await loadImageElement(objectUrl, false);
+    } catch (proxyError) {
+      console.warn("Share image could not be loaded", url, proxyError);
+      return null;
+    }
+  })();
+
+  shareImageCache.set(url, promise);
+  return promise;
+}
+
+async function fetchImageBlobForImport(url: string) {
+  if (!url) throw new Error("No image URL is available.");
+  try {
+    const direct = await fetch(url, { cache: "no-store" });
+    if (direct.ok) return await responseToImageBlob(direct);
+  } catch {
+    // External image hosts commonly block browser fetches. Fall through to the FatBrackets proxy.
+  }
+  const response = await fetch(`/api/image-proxy?url=${encodeURIComponent(url)}`, { cache: "no-store" });
+  if (!response.ok) {
+    let detail = "";
+    try { detail = (await response.json())?.error || ""; } catch {}
+    throw new Error(detail || `Could not import image (${response.status}).`);
+  }
+  return await responseToImageBlob(response);
+}
+
+function isLegacyContestantImage(contestant: Contestant) {
+  if (!contestant.imageUrl || contestant.imageAssetId) return false;
+  if (!/^https?:\/\//i.test(contestant.imageUrl)) return false;
+  return !contestant.imageUrl.includes("/storage/v1/object/public/contestant-images/");
+}
+
+function roundedRect(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.arcTo(x + width, y, x + width, y + height, r);
+  context.arcTo(x + width, y + height, x, y + height, r);
+  context.arcTo(x, y + height, x, y, r);
+  context.arcTo(x, y, x + width, y, r);
+  context.closePath();
+}
+
+async function createBracketShareImage(options: {
+  name: string; creator: string; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; layout: ShareLayout; format: ShareFormat; showImages: boolean; showSeeds: boolean; showCreator: boolean; seedingStyle: SeedingStyle;
+}) {
+  const { width, height } = shareDimensions(options.format);
+  const canvas = document.createElement("canvas");
+  canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Image generation is unavailable in this browser.");
+  const gradient = ctx.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, options.theme.canvasBackgroundColor || "#081426");
+  gradient.addColorStop(1, options.theme.canvasGradientEnd || "#16233d");
+  ctx.fillStyle = gradient; ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "rgba(255,255,255,.045)";
+  for (let x = 0; x < width; x += 32) ctx.fillRect(x, 0, 1, height);
+  for (let y = 0; y < height; y += 32) ctx.fillRect(0, y, width, 1);
+
+  ctx.fillStyle = "#f6f8fb"; ctx.font = `800 ${options.format === "square" ? 48 : 40}px Arial, sans-serif`;
+  ctx.fillText(options.name || "FatBrackets", 48, 64);
+  if (options.showCreator) {
+    ctx.fillStyle = "#aebbd0"; ctx.font = "600 18px Arial, sans-serif";
+    ctx.fillText(options.creator ? `by ${options.creator}` : "FatBrackets", 50, 92);
+  }
+  ctx.textAlign = "right"; ctx.fillStyle = "#ef4444"; ctx.font = "900 22px Arial, sans-serif"; ctx.fillText("FATBRACKETS", width - 48, 62); ctx.textAlign = "left";
+
+  const filled = options.contestants.filter((entry) => entry.name.trim()).sort((a,b) => a.seed-b.seed);
+  const championId = options.winners[matchKey(Math.log2(options.size), 0)];
+  const champion = filled.find((entry) => entry.id === championId);
+  const imageCache = new Map<string, HTMLImageElement | null>();
+  if (options.showImages) {
+    await Promise.all(filled.slice(0, options.layout === "spotlight" ? 8 : filled.length).map(async (entry) => { if (entry.imageUrl) imageCache.set(entry.imageUrl, await loadCanvasImage(entry.imageUrl)); }));
+  }
+  const drawEntry = (entry: Contestant, x: number, y: number, w: number, h: number, selected = false) => {
+    ctx.fillStyle = selected ? (options.theme.selectedCardBackground || "#7f1d1d") : (options.theme.cardBackground || "#14223b");
+    ctx.strokeStyle = selected ? (options.theme.winnerMarkColor || "#ef4444") : (options.theme.cardBorderColor || "#40516e");
+    ctx.lineWidth = Math.max(1, options.theme.cardBorderWidth || 1); roundedRect(ctx, x, y, w, h, Math.min(options.theme.cardRadius || 12, h/3)); ctx.fill(); ctx.stroke();
+    let textX = x + 12;
+    const img = entry.imageUrl ? imageCache.get(entry.imageUrl) : null;
+    if (options.showImages && img && h >= 24) {
+      const d = Math.min(h - 8, 42); ctx.save(); roundedRect(ctx, x + 6, y + 4, d, d, options.theme.imageShape === "circle" ? d/2 : options.theme.imageShape === "square" ? 0 : 8); ctx.clip();
+      const s = Math.min(img.naturalWidth, img.naturalHeight); ctx.drawImage(img, (img.naturalWidth-s)/2, (img.naturalHeight-s)/2, s, s, x+6, y+4, d, d); ctx.restore(); textX = x + d + 14;
+    }
+    const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)}  ` : "";
+    ctx.fillStyle = "#f8fafc"; ctx.font = `800 ${Math.max(10, Math.min(18, h*.34))}px Arial, sans-serif`;
+    const rawLabel = `${seedText}${entry.name}`;
+    const maxChars = Math.max(9, Math.floor((w-(textX-x)-12)/8)); const label = rawLabel.length > maxChars ? rawLabel.slice(0,maxChars-1)+"…" : rawLabel; ctx.fillText(label, textX, y + h*.58);
+  };
+
+  if (options.layout === "spotlight") {
+    const hero = champion || filled[0] || null;
+    const featured = filled.filter((entry) => entry.id !== hero?.id).slice(0, options.format === "square" ? 6 : 4);
+    const heroX = options.format === "square" ? 70 : 64;
+    const heroY = options.format === "square" ? 170 : 150;
+    const heroW = options.format === "square" ? width - 140 : 430;
+    const heroH = options.format === "square" ? 360 : 340;
+
+    ctx.fillStyle = "rgba(255,255,255,.035)";
+    roundedRect(ctx, heroX, heroY, heroW, heroH, 26); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.lineWidth = 1; ctx.stroke();
+
+    if (hero) {
+      const heroImg = hero.imageUrl ? imageCache.get(hero.imageUrl) : null;
+      if (options.showImages && heroImg) {
+        const imageSize = options.format === "square" ? 230 : 215;
+        const imageX = heroX + (heroW - imageSize) / 2;
+        const imageY = heroY + 28;
+        ctx.save(); roundedRect(ctx, imageX, imageY, imageSize, imageSize, options.theme.imageShape === "circle" ? imageSize / 2 : 24); ctx.clip();
+        const s = Math.min(heroImg.naturalWidth, heroImg.naturalHeight);
+        ctx.drawImage(heroImg, (heroImg.naturalWidth-s)/2, (heroImg.naturalHeight-s)/2, s, s, imageX, imageY, imageSize, imageSize); ctx.restore();
+      }
+      ctx.textAlign = "center";
+      ctx.fillStyle = options.theme.winnerMarkColor || "#ef4444";
+      ctx.font = `900 ${options.format === "square" ? 18 : 16}px Arial, sans-serif`;
+      ctx.fillText(champion ? "CURRENT CHAMPION" : "FEATURED ENTRY", heroX + heroW / 2, heroY + heroH - 82);
+      ctx.fillStyle = "#fff";
+      ctx.font = `900 ${options.format === "square" ? 36 : 32}px Arial, sans-serif`;
+      ctx.fillText(hero.name, heroX + heroW / 2, heroY + heroH - 42);
+      ctx.textAlign = "left";
+    }
+
+    const listX = options.format === "square" ? 70 : 535;
+    const listY = options.format === "square" ? 560 : 150;
+    const listW = options.format === "square" ? width - 140 : width - listX - 64;
+    const listCardH = options.format === "square" ? 76 : 72;
+    const listGap = options.format === "square" ? 12 : 14;
+    const cols = options.format === "square" ? 2 : 1;
+    const colGap = 14;
+    const cardW = cols === 1 ? listW : (listW - colGap) / 2;
+    featured.forEach((entry, index) => {
+      const col = index % cols; const row = Math.floor(index / cols);
+      drawEntry(entry, listX + col * (cardW + colGap), listY + row * (listCardH + listGap), cardW, listCardH, entry.id === championId);
+    });
+
+    ctx.fillStyle = "#f8fafc"; ctx.font = `900 ${options.format === "square" ? 31 : 26}px Arial, sans-serif`;
+    const promoY = options.format === "square" ? height - 125 : height - 94;
+    ctx.fillText(`${filled.length} entries. One bracket.`, options.format === "square" ? 70 : 535, promoY);
+    ctx.fillStyle = "#aebbd0"; ctx.font = `700 ${options.format === "square" ? 18 : 16}px Arial, sans-serif`;
+    ctx.fillText("Fill it out, remix it, and share your picks on FatBrackets.", options.format === "square" ? 70 : 535, promoY + 30);
+  } else {
+    const contestantById = new Map(options.contestants.filter((entry) => entry.id).map((entry) => [entry.id as string, entry]));
+    const rounds = Math.log2(options.size);
+    const sideRounds = Math.max(1, rounds - 1);
+    const order = firstRoundSlotOrder(options.size);
+    const participants = (round: number, match: number): Array<Contestant | null> => {
+      if (round === 1) {
+        return [options.contestants[order[match * 2] - 1] ?? null, options.contestants[order[match * 2 + 1] - 1] ?? null];
+      }
+      return [0, 1].map((offset) => {
+        const winnerId = options.winners[matchKey(round - 1, match * 2 + offset)];
+        return winnerId ? contestantById.get(winnerId) ?? null : null;
+      });
+    };
+
+    const contentTop = options.format === "square" ? 145 : 118;
+    const contentBottom = height - (options.format === "square" ? 118 : 58);
+    const contentHeight = contentBottom - contentTop;
+    const centerX = width / 2;
+    const centerGap = options.format === "square" ? 190 : 170;
+    const outerMargin = options.format === "square" ? 28 : 36;
+    const sideSpan = centerX - centerGap / 2 - outerMargin;
+    const columnGap = Math.max(14, options.format === "square" ? 20 : 24);
+    const cardWidth = Math.max(78, Math.min(options.format === "square" ? 150 : 165, (sideSpan - columnGap * (sideRounds - 1)) / sideRounds));
+    const leftXs = Array.from({ length: sideRounds }, (_, index) => outerMargin + index * (cardWidth + columnGap));
+    const rightXs = Array.from({ length: sideRounds }, (_, index) => width - outerMargin - cardWidth - index * (cardWidth + columnGap));
+    const firstCountPerSide = options.size / 4;
+    const firstStep = contentHeight / Math.max(1, firstCountPerSide);
+    const matchHeight = Math.max(19, Math.min(64, firstStep * 0.72));
+    const rowHeight = matchHeight / 2;
+    const fontSize = Math.max(7, Math.min(13, rowHeight * 0.43));
+    const lineWidth = Math.max(1, Math.min(3.5, options.theme.connectorWidth || 2));
+
+    const leftCenters = new Map<string, { x: number; y: number }>();
+    const rightCenters = new Map<string, { x: number; y: number }>();
+    for (let sideIndex = 0; sideIndex < 2; sideIndex++) {
+      const target = sideIndex === 0 ? leftCenters : rightCenters;
+      for (let i = 0; i < firstCountPerSide; i++) {
+        target.set(`1-${i}`, { x: 0, y: contentTop + firstStep * (i + 0.5) });
+      }
+      for (let round = 2; round <= sideRounds; round++) {
+        const count = options.size / 2 ** (round + 1);
+        for (let i = 0; i < count; i++) {
+          const a = target.get(`${round - 1}-${i * 2}`)!;
+          const b = target.get(`${round - 1}-${i * 2 + 1}`)!;
+          target.set(`${round}-${i}`, { x: 0, y: (a.y + b.y) / 2 });
+        }
+      }
+    }
+
+    const connector = (fromX: number, fromY: number, toX: number, toY: number) => {
+      const bend = (fromX + toX) / 2;
+      ctx.beginPath();
+      ctx.moveTo(fromX, fromY);
+      ctx.lineTo(bend, fromY);
+      ctx.lineTo(bend, toY);
+      ctx.lineTo(toX, toY);
+      ctx.stroke();
+    };
+
+    ctx.strokeStyle = options.theme.connectorColor || "#64748b";
+    ctx.lineWidth = lineWidth;
+    if (options.theme.connectorStyle === "dashed") ctx.setLineDash([10, 7]);
+    else if (options.theme.connectorStyle === "dotted") ctx.setLineDash([2, 6]);
+    else ctx.setLineDash([]);
+
+    const drawMatch = (round: number, match: number, x: number, yCenter: number) => {
+      const entries = participants(round, match);
+      const winnerId = options.winners[matchKey(round, match)];
+      const top = yCenter - matchHeight / 2;
+      roundedRect(ctx, x, top, cardWidth, matchHeight, Math.min(options.theme.cardRadius || 10, matchHeight / 4));
+      ctx.fillStyle = options.theme.cardBackground || "#14223b";
+      ctx.fill();
+      ctx.strokeStyle = options.theme.cardBorderColor || "#40516e";
+      ctx.lineWidth = Math.max(1, options.theme.cardBorderWidth || 1);
+      ctx.stroke();
+      entries.forEach((entry, slot) => {
+        const rowTop = top + slot * rowHeight;
+        if (slot === 1) {
+          ctx.beginPath();
+          ctx.moveTo(x + 4, rowTop);
+          ctx.lineTo(x + cardWidth - 4, rowTop);
+          ctx.strokeStyle = options.theme.cardBorderColor || "#40516e";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+        if (!entry) {
+          ctx.fillStyle = "rgba(255,255,255,.36)";
+          ctx.font = `700 ${fontSize}px Arial, sans-serif`;
+          ctx.fillText("TBD", x + 8, rowTop + rowHeight * .63);
+          return;
+        }
+        if (winnerId === entry.id) {
+          ctx.fillStyle = options.theme.selectedCardBackground || "#7f1d1d";
+          ctx.fillRect(x + 1, rowTop + 1, cardWidth - 2, rowHeight - 2);
+        }
+        let textX = x + 8;
+        const img = entry.imageUrl ? imageCache.get(entry.imageUrl) : null;
+        if (options.showImages && img && rowHeight >= 18) {
+          const d = Math.min(rowHeight - 5, 28);
+          ctx.save();
+          roundedRect(ctx, x + 4, rowTop + (rowHeight - d) / 2, d, d, options.theme.imageShape === "circle" ? d / 2 : options.theme.imageShape === "square" ? 0 : 5);
+          ctx.clip();
+          const s = Math.min(img.naturalWidth, img.naturalHeight);
+          ctx.drawImage(img, (img.naturalWidth - s) / 2, (img.naturalHeight - s) / 2, s, s, x + 4, rowTop + (rowHeight - d) / 2, d, d);
+          ctx.restore();
+          textX = x + d + 10;
+        }
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = `800 ${fontSize}px Arial, sans-serif`;
+        const room = cardWidth - (textX - x) - 7;
+        const chars = Math.max(5, Math.floor(room / Math.max(5, fontSize * .58)));
+        const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)} ` : "";
+        const rawLabel = `${seedText}${entry.name}`;
+        const label = rawLabel.length > chars ? rawLabel.slice(0, Math.max(1, chars - 1)) + "…" : rawLabel;
+        ctx.fillText(label, textX, rowTop + rowHeight * .63);
+      });
+    };
+
+    for (const side of ["left", "right"] as const) {
+      const centers = side === "left" ? leftCenters : rightCenters;
+      const xs = side === "left" ? leftXs : rightXs;
+      for (let round = 1; round <= sideRounds; round++) {
+        const count = options.size / 2 ** (round + 1);
+        const offset = side === "left" ? 0 : count;
+        for (let localMatch = 0; localMatch < count; localMatch++) {
+          const center = centers.get(`${round}-${localMatch}`)!;
+          drawMatch(round, offset + localMatch, xs[round - 1], center.y);
+          if (round > 1) {
+            const childA = centers.get(`${round - 1}-${localMatch * 2}`)!;
+            const childB = centers.get(`${round - 1}-${localMatch * 2 + 1}`)!;
+            if (side === "left") {
+              connector(xs[round - 2] + cardWidth, childA.y, xs[round - 1], center.y);
+              connector(xs[round - 2] + cardWidth, childB.y, xs[round - 1], center.y);
+            } else {
+              connector(xs[round - 2], childA.y, xs[round - 1] + cardWidth, center.y);
+              connector(xs[round - 2], childB.y, xs[round - 1] + cardWidth, center.y);
+            }
+          }
+        }
+      }
+    }
+
+    const finalists = participants(rounds, 0);
+    const finalWinnerId = options.winners[matchKey(rounds, 0)];
+    const finalWidth = Math.max(118, centerGap - 30);
+    const finalX = centerX - finalWidth / 2;
+    const finalHeight = Math.max(58, Math.min(88, contentHeight * .16));
+    const finalTop = contentTop + contentHeight * .5 - finalHeight / 2;
+    const finalRow = finalHeight / 2;
+    const semifinalLeftY = leftCenters.get(`${sideRounds}-0`)?.y ?? centerX;
+    const semifinalRightY = rightCenters.get(`${sideRounds}-0`)?.y ?? centerX;
+    connector(leftXs[sideRounds - 1] + cardWidth, semifinalLeftY, finalX, finalTop + finalRow / 2);
+    connector(rightXs[sideRounds - 1], semifinalRightY, finalX + finalWidth, finalTop + finalRow * 1.5);
+
+    roundedRect(ctx, finalX, finalTop, finalWidth, finalHeight, 12);
+    ctx.fillStyle = options.theme.cardBackground || "#14223b";
+    ctx.fill();
+    ctx.strokeStyle = options.theme.cardBorderColor || "#40516e";
+    ctx.lineWidth = Math.max(1, options.theme.cardBorderWidth || 1);
+    ctx.stroke();
+    finalists.forEach((entry, slot) => {
+      const y = finalTop + slot * finalRow;
+      if (slot === 1) {
+        ctx.beginPath(); ctx.moveTo(finalX + 4, y); ctx.lineTo(finalX + finalWidth - 4, y); ctx.stroke();
+      }
+      if (!entry) {
+        ctx.fillStyle = "rgba(255,255,255,.35)"; ctx.font = "700 10px Arial, sans-serif"; ctx.fillText("Finalist TBD", finalX + 8, y + finalRow * .62); return;
+      }
+      if (entry.id === finalWinnerId) { ctx.fillStyle = options.theme.selectedCardBackground || "#7f1d1d"; ctx.fillRect(finalX + 1, y + 1, finalWidth - 2, finalRow - 2); }
+      ctx.fillStyle = "#fff"; ctx.font = `800 ${Math.max(9, Math.min(13, finalRow * .34))}px Arial, sans-serif`;
+      const maxChars = Math.max(7, Math.floor((finalWidth - 16) / 7.2));
+      const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)} ` : "";
+      const rawLabel = `${seedText}${entry.name}`;
+      const label = rawLabel.length > maxChars ? rawLabel.slice(0, maxChars - 1) + "…" : rawLabel;
+      ctx.fillText(label, finalX + 8, y + finalRow * .62);
+    });
+
+    const champion = finalWinnerId ? contestantById.get(finalWinnerId) : null;
+    const champY = Math.min(contentBottom - 6, finalTop + finalHeight + 34);
+    ctx.textAlign = "center";
+    ctx.fillStyle = options.theme.winnerMarkColor || "#ef4444";
+    ctx.font = `900 ${options.format === "square" ? 18 : 15}px Arial, sans-serif`;
+    ctx.fillText(champion ? `★ ${champion.name}` : "CHAMPION TBD", centerX, champY);
+    ctx.fillStyle = "#9fb0c8";
+    ctx.font = "700 8px Arial, sans-serif";
+    ctx.fillText("FATBRACKETS CHAMPION", centerX, champY + 14);
+    ctx.textAlign = "left";
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle="#aebbd0";ctx.font="700 15px Arial, sans-serif";ctx.fillText("Fill it out • Remix it • Share it",48,height-28);ctx.textAlign="right";ctx.fillText("fatbrackets.com",width-48,height-28);ctx.textAlign="left";
+  return await new Promise<Blob>((resolve,reject)=>canvas.toBlob((blob)=>blob?resolve(blob):reject(new Error("Could not create share image.")),"image/png",.94));
+}
+
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [view, setView] = useState<View>("dashboard");
@@ -247,6 +678,17 @@ export default function Home() {
   const [authMessage, setAuthMessage] = useState("");
   const [appSettings, setAppSettings] = useState<AppSettings>(loadAppSettings);
   const [bracketTheme, setBracketTheme] = useState<BracketTheme>(defaultBracketTheme);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [favoriteIds, setFavoriteIds] = useState<string[]>([]);
+  const [favoriteBrackets, setFavoriteBrackets] = useState<Tournament[]>([]);
+  const [publicProfile, setPublicProfile] = useState<UserProfile | null>(null);
+  const [publicProfileBrackets, setPublicProfileBrackets] = useState<Tournament[]>([]);
+  const [activeOwnerProfile, setActiveOwnerProfile] = useState<UserProfile | null>(null);
+  const [fillMode, setFillMode] = useState(false);
+  const [submissionWinners, setSubmissionWinners] = useState<WinnerMap>({});
+  const [submissionState, setSubmissionState] = useState<SaveState>("idle");
+  const [recentSubmissions, setRecentSubmissions] = useState<Array<BracketSubmission & { tournaments?: Tournament | Tournament[] | null }>>([]);
+  const sharedRouteHandledRef = useRef(false);
 
   function navigate(nextView: View, options?: { replace?: boolean }) {
     if (nextView === view) return;
@@ -278,8 +720,91 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (session) loadDashboard();
+    if (session) { loadDashboard(); loadProfile(); loadFavorites(); loadRecentSubmissions(); }
+    else { setProfile(null); setFavoriteIds([]); setFavoriteBrackets([]); }
   }, [session]);
+
+  useEffect(() => {
+    if (sharedRouteHandledRef.current) return;
+    const key = new URLSearchParams(window.location.search).get("bracket");
+    if (!key) return;
+    sharedRouteHandledRef.current = true;
+    (async () => {
+      let { data } = await supabase.from("tournaments")
+        .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
+        .eq("slug", key).eq("visibility", "public").maybeSingle();
+      if (!data && /^[0-9a-f-]{20,}$/i.test(key)) {
+        const result = await supabase.from("tournaments")
+          .select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json")
+          .eq("id", key).eq("visibility", "public").maybeSingle();
+        data = result.data;
+      }
+      if (data) await openTournament(data as Tournament, "bracket");
+    })();
+  }, []);
+
+  async function loadProfile() {
+    if (!session) return;
+    const { data } = await supabase.from("profiles").select("id,display_name,first_name,last_name,location,bio,avatar_url").eq("id", session.user.id).maybeSingle();
+    const fallback = { id: session.user.id, display_name: "", first_name: "", last_name: "", location: "", bio: "", avatar_url: "" };
+    setProfile({ ...fallback, ...(data ?? {}) } as UserProfile);
+  }
+
+  async function loadFavorites() {
+    if (!session) return;
+    const { data } = await supabase.from("bracket_favorites").select("tournament_id,tournaments(id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json)").eq("user_id", session.user.id).order("created_at", { ascending: false });
+    const rows = (data ?? []) as unknown as Array<{ tournament_id: string; tournaments: Tournament | Tournament[] | null }>;
+    setFavoriteIds(rows.map((row) => row.tournament_id));
+    setFavoriteBrackets(rows.map((row) => Array.isArray(row.tournaments) ? row.tournaments[0] : row.tournaments).filter(Boolean) as Tournament[]);
+  }
+
+  async function toggleFavorite(tournament: Tournament) {
+    if (!session) { setAuthOpen(true); return; }
+    if (favoriteIds.includes(tournament.id)) await supabase.from("bracket_favorites").delete().eq("user_id", session.user.id).eq("tournament_id", tournament.id);
+    else await supabase.from("bracket_favorites").insert({ user_id: session.user.id, tournament_id: tournament.id });
+    await loadFavorites();
+  }
+
+  async function saveProfile(next: UserProfile) {
+    if (!session) return;
+    const displayName = next.display_name.trim() || [next.first_name, next.last_name].filter(Boolean).join(" ").trim();
+    const payload = { ...next, id: session.user.id, display_name: displayName, updated_at: new Date().toISOString() };
+    const { error } = await supabase.from("profiles").upsert(payload);
+    if (error) throw error;
+    setProfile({ ...next, display_name: displayName });
+  }
+
+  async function loadRecentSubmissions() {
+    if (!session) return;
+    const { data } = await supabase.from("bracket_submissions")
+      .select("id,tournament_id,user_id,picks,champion_id,submitted_at,updated_at,tournaments(id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json)")
+      .eq("user_id", session.user.id)
+      .order("submitted_at", { ascending: false })
+      .limit(8);
+    setRecentSubmissions((data ?? []) as unknown as Array<BracketSubmission & { tournaments?: Tournament | Tournament[] | null }>);
+  }
+
+  async function openUserProfile(userId: string) {
+    const [{ data: person }, { data: brackets }] = await Promise.all([
+      supabase.from("profiles").select("id,display_name,first_name,last_name,location,bio,avatar_url").eq("id", userId).maybeSingle(),
+      supabase.from("tournaments").select("id,owner_id,name,slug,bracket_size,status,visibility,tags,voting_enabled,updated_at,cloned_from_id,cloned_from_name,theme_json").eq("owner_id", userId).eq("visibility", "public").order("updated_at", { ascending: false }).limit(12),
+    ]);
+    setPublicProfile(person ? ({ ...person, id: userId, display_name: person.display_name ?? "", first_name: person.first_name ?? "", last_name: person.last_name ?? "", location: person.location ?? "", bio: person.bio ?? "", avatar_url: person.avatar_url ?? "" } as UserProfile) : null);
+    setPublicProfileBrackets((brackets ?? []) as Tournament[]);
+    navigate("public-profile");
+  }
+
+  async function uploadProfileAvatar(source: ImageUploadPayload) {
+    if (!session) return;
+    const processed = source instanceof File ? await processContestantImage(source) : source.processed;
+    const path = `${session.user.id}/${processed.hash}.webp`;
+    const { error: uploadError } = await supabase.storage.from("profile-avatars").upload(path, processed.blob, { contentType: "image/webp", cacheControl: "31536000", upsert: true });
+    if (uploadError) throw uploadError;
+    const { data } = supabase.storage.from("profile-avatars").getPublicUrl(path);
+    const next = { ...(profile ?? { id: session.user.id, display_name: "", first_name: "", last_name: "", location: "", bio: "", avatar_url: "" }), avatar_url: data.publicUrl };
+    await saveProfile(next);
+    return data.publicUrl;
+  }
 
   async function loadDashboard() {
     setLoading(true);
@@ -330,10 +855,15 @@ export default function Home() {
     }
     window.localStorage.setItem(lastBracketKey, tournament.id);
     setLoading(true);
-    const [{ data: contestantRows }, { data: matchRows }] = await Promise.all([
+    setFillMode(false);
+    setSubmissionWinners({});
+    setSubmissionState("idle");
+    const [{ data: contestantRows }, { data: matchRows }, { data: ownerProfile }] = await Promise.all([
       supabase.from("contestants").select("*").eq("tournament_id", tournament.id).order("seed"),
       supabase.from("matches").select("round_number,match_number,winner_id").eq("tournament_id", tournament.id),
+      supabase.from("profiles").select("id,display_name,first_name,last_name,location,bio,avatar_url").eq("id", tournament.owner_id).maybeSingle(),
     ]);
+    setActiveOwnerProfile(ownerProfile ? ({ ...ownerProfile, id: tournament.owner_id, display_name: ownerProfile.display_name ?? "", first_name: ownerProfile.first_name ?? "", last_name: ownerProfile.last_name ?? "", location: ownerProfile.location ?? "", bio: ownerProfile.bio ?? "", avatar_url: ownerProfile.avatar_url ?? "" } as UserProfile) : null);
     const slots = blankContestants(tournament.bracket_size);
     (contestantRows ?? []).forEach((row) => {
       slots[row.seed - 1] = {
@@ -423,8 +953,8 @@ export default function Home() {
       window.alert(`Could not clone bracket: ${contestantError.message}`);
       return;
     }
-    const clonedTags = Array.from(new Set([...(source.tags ?? ["Undefined"]), "Cloned"]));
-    const cloneName = `${source.name} (Clone)`;
+    const clonedTags = Array.from(new Set([...(source.tags ?? ["Undefined"]), "Remixed"]));
+    const cloneName = `${source.name} (Remix)`;
     const slug = `${source.slug || source.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-clone-${crypto.randomUUID().slice(0, 8)}`;
     const { data: cloned, error: cloneError } = await supabase
       .from("tournaments")
@@ -620,6 +1150,32 @@ export default function Home() {
     setSaveState("idle");
   }
 
+  async function storeProcessedContestantImage(contestant: Contestant | undefined, processed: ProcessedImage, label: string) {
+    if (!session) throw new Error("Sign in to save images.");
+    const { data: existing } = await supabase.from("image_assets").select("id,public_url").eq("content_hash", processed.hash).maybeSingle();
+    if (existing) return { imageUrl: existing.public_url, imageAssetId: existing.id as string };
+
+    const path = `${session.user.id}/library/${processed.hash}.webp`;
+    const { error: uploadError } = await supabase.storage.from("contestant-images").upload(path, processed.blob, { contentType: "image/webp", cacheControl: "31536000", upsert: false });
+    if (uploadError && !uploadError.message.toLowerCase().includes("already exists")) throw uploadError;
+    const { data: publicData } = supabase.storage.from("contestant-images").getPublicUrl(path);
+    const normalizedName = (contestant?.name || label.replace(/\.[^.]+$/, "")).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const { data: asset, error: assetError } = await supabase.from("image_assets").insert({
+      owner_id: session.user.id,
+      label: contestant?.name || label,
+      normalized_name: normalizedName,
+      storage_path: path,
+      public_url: publicData.publicUrl,
+      content_hash: processed.hash,
+      width: processed.width,
+      height: processed.height,
+      file_size: processed.blob.size,
+      mime_type: "image/webp",
+    }).select("id,public_url").single();
+    if (assetError) throw assetError;
+    return { imageUrl: asset.public_url as string, imageAssetId: asset.id as string };
+  }
+
   async function uploadContestantImage(seed: number, source: ImageUploadPayload) {
     if (!session) { setAuthOpen(true); return; }
     let activeId = tournamentId;
@@ -630,29 +1186,42 @@ export default function Home() {
       const contestant = contestants.find((item) => item.seed === seed);
       const processed = source instanceof File ? await processContestantImage(source) : source.processed;
       const label = source instanceof File ? source.name : source.label;
-      const { data: existing } = await supabase.from("image_assets").select("id,public_url").eq("content_hash", processed.hash).maybeSingle();
-      if (existing) {
-        updateContestant(seed, { imageUrl: existing.public_url, imageAssetId: existing.id });
-        setSaveState("idle");
-        return;
-      }
-      const path = `${session.user.id}/library/${processed.hash}.webp`;
-      const { error: uploadError } = await supabase.storage.from("contestant-images").upload(path, processed.blob, { contentType: "image/webp", cacheControl: "31536000", upsert: false });
-      if (uploadError && !uploadError.message.toLowerCase().includes("already exists")) throw uploadError;
-      const { data: publicData } = supabase.storage.from("contestant-images").getPublicUrl(path);
-      const normalizedName = (contestant?.name || label.replace(/\.[^.]+$/, "")).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-      const { data: asset, error: assetError } = await supabase.from("image_assets").insert({
-        owner_id: session.user.id, label: contestant?.name || label, normalized_name: normalizedName, storage_path: path, public_url: publicData.publicUrl,
-        content_hash: processed.hash, width: processed.width, height: processed.height, file_size: processed.blob.size, mime_type: "image/webp",
-      }).select("id,public_url").single();
-      if (assetError) throw assetError;
-      updateContestant(seed, { imageUrl: asset.public_url, imageAssetId: asset.id });
+      const stored = await storeProcessedContestantImage(contestant, processed, label);
+      updateContestant(seed, stored);
       setSaveState("idle");
     } catch (error) {
       console.error(error);
       window.alert(error instanceof Error ? error.message : "Could not upload image.");
       setSaveState("error");
     }
+  }
+
+  async function cacheLegacyContestantImages() {
+    if (!session) { setAuthOpen(true); return { total: 0, cached: 0, failed: 0 }; }
+    const legacy = contestants.filter((item) => item.name && isLegacyContestantImage(item));
+    if (!legacy.length) return { total: 0, cached: 0, failed: 0 };
+
+    const updates = new Map<number, Partial<Contestant>>();
+    let failed = 0;
+    for (const contestant of legacy) {
+      try {
+        const blob = await fetchImageBlobForImport(contestant.imageUrl);
+        const extension = blob.type.split("/")[1] || "jpg";
+        const file = new File([blob], `${contestant.name || `entry-${contestant.seed}`}.${extension}`, { type: blob.type });
+        const processed = await processContestantImage(file);
+        const stored = await storeProcessedContestantImage(contestant, processed, file.name);
+        updates.set(contestant.seed, stored);
+      } catch (error) {
+        failed += 1;
+        console.warn(`Could not cache legacy image for ${contestant.name}`, contestant.imageUrl, error);
+      }
+    }
+
+    if (updates.size) {
+      setContestants((current) => current.map((item) => updates.has(item.seed) ? { ...item, ...updates.get(item.seed) } : item));
+      setSaveState("idle");
+    }
+    return { total: legacy.length, cached: updates.size, failed };
   }
 
   async function saveTournament(): Promise<string | null> {
@@ -784,46 +1353,62 @@ export default function Home() {
     });
   }
 
-  function selectWinner(round: number, match: number, contestant: Contestant) {
-    if (!contestant.id) return;
-
-    setWinners((current) => {
-      const next: WinnerMap = {
-        ...current,
-        [matchKey(round, match)]: contestant.id as string,
-      };
-      const rounds = Math.log2(size);
+  function submissionParticipants(round: number, match: number): Array<Contestant | null> {
+    if (round === 1) {
       const order = firstRoundSlotOrder(size);
-
-      // Revalidate the bracket from the first round forward. A later pick is
-      // preserved when that contestant is still a valid participant in the
-      // matchup; only selections made impossible by the changed result are removed.
-      for (let currentRound = 1; currentRound <= rounds; currentRound++) {
-        const matchCount = size / 2 ** currentRound;
-
-        for (let currentMatch = 0; currentMatch < matchCount; currentMatch++) {
-          let participantIds: Array<string | undefined>;
-
-          if (currentRound === 1) {
-            participantIds = [
-              contestants[order[currentMatch * 2] - 1]?.id,
-              contestants[order[currentMatch * 2 + 1] - 1]?.id,
-            ];
-          } else {
-            participantIds = [
-              next[matchKey(currentRound - 1, currentMatch * 2)],
-              next[matchKey(currentRound - 1, currentMatch * 2 + 1)],
-            ];
-          }
-
-          const key = matchKey(currentRound, currentMatch);
-          const winnerId = next[key];
-          if (winnerId && !participantIds.includes(winnerId)) delete next[key];
-        }
-      }
-
-      return next;
+      return [contestants[order[match * 2] - 1] ?? null, contestants[order[match * 2 + 1] - 1] ?? null];
+    }
+    return [0, 1].map((offset) => {
+      const winnerId = submissionWinners[matchKey(round - 1, match * 2 + offset)];
+      return winnerId ? contestantById.get(winnerId) ?? null : null;
     });
+  }
+
+  function updateWinnerMap(current: WinnerMap, round: number, match: number, contestant: Contestant) {
+    if (!contestant.id) return current;
+    const next: WinnerMap = { ...current, [matchKey(round, match)]: contestant.id };
+    const rounds = Math.log2(size);
+    const order = firstRoundSlotOrder(size);
+    for (let currentRound = 1; currentRound <= rounds; currentRound++) {
+      const matchCount = size / 2 ** currentRound;
+      for (let currentMatch = 0; currentMatch < matchCount; currentMatch++) {
+        const participantIds = currentRound === 1
+          ? [contestants[order[currentMatch * 2] - 1]?.id, contestants[order[currentMatch * 2 + 1] - 1]?.id]
+          : [next[matchKey(currentRound - 1, currentMatch * 2)], next[matchKey(currentRound - 1, currentMatch * 2 + 1)]];
+        const key = matchKey(currentRound, currentMatch);
+        if (next[key] && !participantIds.includes(next[key])) delete next[key];
+      }
+    }
+    return next;
+  }
+
+  function selectSubmissionWinner(round: number, match: number, contestant: Contestant) {
+    setSubmissionWinners((current) => updateWinnerMap(current, round, match, contestant));
+    setSubmissionState("idle");
+  }
+
+  async function beginFillOut() {
+    if (!session) { setAuthOpen(true); return; }
+    if (!tournamentId) return;
+    const { data } = await supabase.from("bracket_submissions").select("picks").eq("tournament_id", tournamentId).eq("user_id", session.user.id).maybeSingle();
+    setSubmissionWinners((data?.picks as WinnerMap | null) ?? {});
+    setFillMode(true);
+    setSubmissionState(data ? "saved" : "idle");
+  }
+
+  async function submitFilledBracket() {
+    if (!session || !tournamentId) { setAuthOpen(true); return; }
+    const championId = submissionWinners[matchKey(Math.log2(size), 0)] ?? null;
+    if (!championId) { window.alert("Complete the bracket and choose a champion before submitting."); return; }
+    setSubmissionState("saving");
+    const payload = { tournament_id: tournamentId, user_id: session.user.id, picks: submissionWinners, champion_id: championId, submitted_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const { error } = await supabase.from("bracket_submissions").upsert(payload, { onConflict: "tournament_id,user_id" });
+    setSubmissionState(error ? "error" : "saved");
+    if (!error) await loadRecentSubmissions();
+  }
+
+  function selectWinner(round: number, match: number, contestant: Contestant) {
+    setWinners((current) => updateWinnerMap(current, round, match, contestant));
     setSaveState("idle");
   }
 
@@ -883,6 +1468,8 @@ export default function Home() {
         onDashboard={() => { navigate("dashboard"); loadDashboard(); }}
         onExplore={() => { navigate("explore"); loadExplore(); }}
         onAdmin={() => navigate("admin")}
+        onProfile={() => navigate("profile")}
+        profileName={profile?.display_name || [profile?.first_name, profile?.last_name].filter(Boolean).join(" ")}
         onSignIn={() => setAuthOpen(true)}
       />
 
@@ -909,6 +1496,8 @@ export default function Home() {
           onOpenOriginal={openOriginalBracket}
           canClone={Boolean(session)}
           currentUserId={session?.user.id ?? null}
+          favoriteIds={favoriteIds}
+          onFavorite={toggleFavorite}
         />
       )}
 
@@ -981,6 +1570,7 @@ export default function Home() {
           onRandomizeAll={() => randomizeRange(1, size)}
           onRandomizeRegion={(regionIndex) => randomizeRange(regionIndex * 16 + 1, regionIndex * 16 + 16)}
           onUploadImage={uploadContestantImage}
+          onCacheLegacyImages={cacheLegacyContestantImages}
           onMergeImport={(entries) => {
             setContestants((current) => mergeImportedEntries(current, entries));
             setWinners({});
@@ -999,6 +1589,24 @@ export default function Home() {
       )}
 
 
+      {view === "profile" && session && profile && (
+        <ProfilePage
+          profile={profile}
+          email={session.user.email || ""}
+          createdBrackets={tournaments.slice(0, 6)}
+          favoriteBrackets={favoriteBrackets.slice(0, 6)}
+          recentSubmissions={recentSubmissions}
+          onSave={saveProfile}
+          onUploadAvatar={uploadProfileAvatar}
+          onOpen={(item) => openTournament(item, "bracket")}
+          onRemix={cloneTournament}
+        />
+      )}
+
+      {view === "public-profile" && publicProfile && (
+        <PublicProfilePage profile={publicProfile} brackets={publicProfileBrackets} onOpen={(item) => openTournament(item, "bracket")} onRemix={cloneTournament} />
+      )}
+
       {view === "admin" && (
         <AdminSettings
           settings={appSettings}
@@ -1010,21 +1618,29 @@ export default function Home() {
       {view === "bracket" && (
         <Bracket
           tournamentId={tournamentId}
+          slug={activeTournament?.slug || ""}
           contestants={contestants}
           name={tournamentName}
           saveState={saveState}
           size={size}
-          winners={winners}
+          winners={fillMode ? submissionWinners : winners}
           regionNames={regionNames}
           seedingStyle={seedingStyle}
           settings={appSettings}
           theme={bracketTheme}
-          editable={activeIsOwner}
-          participants={roundParticipants}
-          onSave={saveBracket}
-          onClear={clearBracket}
+          editable={activeIsOwner || fillMode}
+          participants={fillMode ? submissionParticipants : roundParticipants}
+          onSave={fillMode ? submitFilledBracket : saveBracket}
+          onClear={fillMode ? () => { setSubmissionWinners({}); setSubmissionState("idle"); } : clearBracket}
           onEdit={() => navigate("manage")}
-          onWinner={selectWinner}
+          onWinner={fillMode ? selectSubmissionWinner : selectWinner}
+          isOwner={activeIsOwner}
+          fillMode={fillMode}
+          submissionState={submissionState}
+          onBeginFill={beginFillOut}
+          onExitFill={() => { setFillMode(false); setSubmissionWinners({}); setSubmissionState("idle"); }}
+          ownerProfile={activeOwnerProfile}
+          onOpenOwnerProfile={() => activeTournament && openUserProfile(activeTournament.owner_id)}
         />
       )}
 
@@ -1045,14 +1661,12 @@ export default function Home() {
   );
 }
 
-function AppHeader({ session, view, canGoBack, onBack, onDashboard, onExplore, onAdmin, onSignIn }: { session: Session | null; view: View; canGoBack: boolean; onBack: () => void; onDashboard: () => void; onExplore: () => void; onAdmin: () => void; onSignIn: () => void }) {
+function AppHeader({ session, profileName, view, canGoBack, onBack, onDashboard, onExplore, onAdmin, onProfile, onSignIn }: { session: Session | null; profileName: string; view: View; canGoBack: boolean; onBack: () => void; onDashboard: () => void; onExplore: () => void; onAdmin: () => void; onProfile: () => void; onSignIn: () => void }) {
   return <header className="appHeader">
     <button className="appBackButton" onClick={onBack} disabled={!canGoBack} aria-label="Go back">←</button>
     <button className="brand brandButton" onClick={onDashboard}><i>///</i>Fat<span>Brackets</span></button>
     <nav><button className={view === "dashboard" ? "active" : ""} onClick={onDashboard}>My Brackets</button><button className={view === "explore" ? "active" : ""} onClick={onExplore}>Explore</button>{session && <button className={view === "admin" ? "active" : ""} onClick={onAdmin}>Admin</button>}</nav>
-    {session
-      ? <button className="profile" onClick={() => supabase.auth.signOut()}><span className="profileAvatar">{session.user.email?.slice(0, 1).toUpperCase() || "U"}</span> <b>Sign out</b></button>
-      : <button className="profile" onClick={onSignIn}>FB <b>Sign in</b></button>}
+    <div className="headerAccount">{session ? <><button className={`profileNameButton ${view === "profile" ? "active" : ""}`} onClick={onProfile}>{profileName || "Profile"}</button><button className="signOutButton" onClick={() => supabase.auth.signOut()}>Sign out</button></> : <button className="profileNameButton" onClick={onSignIn}>Sign in</button>}</div>
   </header>;
 }
 
@@ -1072,14 +1686,14 @@ function Dashboard({ loading, session, tournaments, onNew, onOpen, onManage, onC
           <div className="cardBracket"><span /><span /><span /><span /></div>
           <div className="cardMeta"><span className={`statusPill ${item.status}`}>{item.status}</span><span>{item.bracket_size} contestants</span></div>
           <h3>{item.name}</h3>
-          {item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Cloned from {item.cloned_from_name || "original bracket"} ↗</button>}
+          {item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Remixed from {item.cloned_from_name || "original bracket"} ↗</button>}
           <p>Updated {new Date(item.updated_at).toLocaleDateString()}</p>
-          <button className="cloneTextButton" onClick={() => onClone(item)}>Clone bracket</button><div className="cardActions adminCardActions"><button className="manageButton" onClick={() => onManage(item)}>Manage</button><button onClick={() => onOpen(item)}>Open Bracket</button></div>
+          <button className="cloneTextButton" onClick={() => onClone(item)}>Remix bracket</button><div className="cardActions adminCardActions"><button className="manageButton" onClick={() => onManage(item)}>Manage</button><button onClick={() => onOpen(item)}>Open Bracket</button></div>
         </article>)}</div>}
   </div>;
 }
 
-function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal, canClone, currentUserId }: { loading: boolean; brackets: Tournament[]; onOpen: (item: Tournament) => void; onCreate: () => void; onClone: (item: Tournament) => void; onOpenOriginal: (id: string) => void; canClone: boolean; currentUserId: string | null }) {
+function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal, canClone, currentUserId, favoriteIds, onFavorite }: { loading: boolean; brackets: Tournament[]; onOpen: (item: Tournament) => void; onCreate: () => void; onClone: (item: Tournament) => void; onOpenOriginal: (id: string) => void; canClone: boolean; currentUserId: string | null; favoriteIds: string[]; onFavorite: (item: Tournament) => void }) {
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const categories = [
     { icon: "♫", title: "Music", text: "Songs, albums, artists and eras." },
@@ -1096,7 +1710,7 @@ function Explore({ loading, brackets, onOpen, onCreate, onClone, onOpenOriginal,
     <section className="exploreSection"><div className="dashboardTop"><div><h2>{activeTag ? `${activeTag} brackets` : "Public brackets"}</h2><p>Published brackets from the FatBrackets community.</p></div><span>{visible.length} available</span></div>
       {loading ? <div className="loadingState">Loading public brackets…</div>
         : visible.length === 0 ? <div className="exploreEmpty"><b>No brackets found here yet.</b><p>Create the first public bracket for this tag and claim the lane.</p><button onClick={onCreate}>Create the first contender</button></div>
-        : <div className="tournamentGrid exploreGrid">{visible.map((item) => <article className={`tournamentCard exploreTournamentCard ${currentUserId === item.owner_id ? "ownedByMe" : "communityOwned"}`} key={item.id}><div className="ownershipRibbon">{currentUserId === item.owner_id ? "Your bracket" : "Community bracket"}</div><div className="cardBracket"><span /><span /><span /><span /></div><div className="cardMeta"><span className={`statusPill ${item.status}`}>{item.status}</span><span>{item.bracket_size} contestants</span></div><h3>{item.name}</h3>{item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Cloned from {item.cloned_from_name || "original bracket"} ↗</button>}<div className="tagRow">{(item.tags ?? []).slice(0,4).map((tag) => <span key={tag}>{tag}</span>)}</div><p>Updated {new Date(item.updated_at).toLocaleDateString()}</p><div className="cardActions exploreActions"><button onClick={() => onOpen(item)}>View Bracket</button><button onClick={() => onClone(item)}>{canClone ? "Clone" : "Sign in to clone"}</button></div></article>)}</div>}
+        : <div className="tournamentGrid exploreGrid">{visible.map((item) => <article className={`tournamentCard exploreTournamentCard ${currentUserId === item.owner_id ? "ownedByMe" : "communityOwned"}`} key={item.id}><div className="ownershipRibbon">{currentUserId === item.owner_id ? "Your bracket" : "Community bracket"}</div><div className="cardBracket"><span /><span /><span /><span /></div><div className="cardMeta"><span className={`statusPill ${item.status}`}>{item.status}</span><span>{item.bracket_size} contestants</span></div><h3>{item.name}</h3>{item.cloned_from_id && <button className="cloneLineage" onClick={() => onOpenOriginal(item.cloned_from_id as string)}>Remixed from {item.cloned_from_name || "original bracket"} ↗</button>}<div className="tagRow">{(item.tags ?? []).slice(0,4).map((tag) => <span key={tag}>{tag}</span>)}</div><p>Updated {new Date(item.updated_at).toLocaleDateString()}</p><div className="cardActions exploreActions"><button onClick={() => onOpen(item)}>View Bracket</button><button onClick={() => onClone(item)}>{canClone ? "Remix" : "Sign in to remix"}</button><button className={`favoriteButton ${favoriteIds.includes(item.id) ? "active" : ""}`} onClick={() => onFavorite(item)}>{favoriteIds.includes(item.id) ? "★ Favorited" : "☆ Favorite"}</button></div></article>)}</div>}
     </section>
   </div>;
 }
@@ -1127,7 +1741,7 @@ function TagSelector({ tags, onChange, compact = false }: { tags: string[]; onCh
     <div><b>Tags</b><small>Select at least one main tag. Undefined is the default.</small></div>
     <div className="primaryTagGrid">{primaryTags.map((tag) => <button type="button" className={primarySelected.includes(tag) ? "chosen" : ""} key={tag} onClick={() => togglePrimary(tag)}>{tag}</button>)}</div>
     <div className="customTagInput"><input value={customTag} maxLength={30} placeholder="Add a custom tag" onChange={(event) => setCustomTag(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addCustomTag(); } }} /><button type="button" onClick={addCustomTag}>Add</button></div>
-    {customTags.length > 0 && <div className="tagRow editable">{customTags.map((tag) => tag === "Cloned" ? <span className="lockedTag" key={tag}>{tag}</span> : <button type="button" key={tag} onClick={() => onChange(tags.filter((item) => item !== tag))}>{tag} ×</button>)}</div>}
+    {customTags.length > 0 && <div className="tagRow editable">{customTags.map((tag) => ["Remixed", "Cloned"].includes(tag) ? <span className="lockedTag" key={tag}>{tag}</span> : <button type="button" key={tag} onClick={() => onChange(tags.filter((item) => item !== tag))}>{tag} ×</button>)}</div>}
   </section>;
 }
 
@@ -1477,24 +2091,27 @@ function ManageBracket(props: {
   onName: (value: string) => void; onRegionNames: (names: string[]) => void; onPlayMode: (mode: PlayMode) => void; onTags: (tags: string[]) => void; onVisibility: (visibility: "private" | "public") => void; onSeedingStyle: (style: SeedingStyle) => void;
   onSelectSeed: (seed: number | null) => void; onUpdateContestant: (seed: number, patch: Partial<Contestant>) => void;
   onSwap: (fromSeed: number, toSeed: number) => void; onToggleLock: (seed: number) => void;
-  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, source: ImageUploadPayload) => void | Promise<void>; onMergeImport: (entries: ImportedEntry[]) => void; onDelete: () => void;
+  onRandomizeAll: () => void; onRandomizeRegion: (index: number) => void; onUploadImage: (seed: number, source: ImageUploadPayload) => void | Promise<void>; onCacheLegacyImages: () => Promise<{ total: number; cached: number; failed: number }>; onMergeImport: (entries: ImportedEntry[]) => void; onDelete: () => void;
   clonedFromId: string | null; clonedFromName: string | null; onOpenOriginal: (id: string) => void;
   theme: BracketTheme; settings: AppSettings; currentUserId: string; onThemeChange: (theme: BracketTheme) => void;
 }) {
   type ManageTab = "settings" | "entries" | "styler" | "importer";
   const [activeTab, setActiveTab] = useState<ManageTab>("settings");
   const [entrySearch, setEntrySearch] = useState("");
+  const [legacyCacheState, setLegacyCacheState] = useState<"idle" | "working">("idle");
+  const [legacyCacheMessage, setLegacyCacheMessage] = useState("");
   const selected = props.contestants.find((item) => item.seed === props.selectedSeed);
   const [draggedSeed, setDraggedSeed] = useState<number | null>(null);
   const regionCount = props.size >= 32 ? props.size / 16 : 1;
   const names = regionCount === 1 ? ["Field"] : Array.from({ length: regionCount }, (_, index) => props.regionNames[index] || `Region ${index + 1}`);
+  const legacyImageCount = props.contestants.filter((item) => item.name && isLegacyContestantImage(item)).length;
 
   return <div className="managePage">
     <div className="manageTopbar">
       <div><small>MANAGE BRACKET</small><input className="manageName" value={props.name} onChange={(event) => props.onName(event.target.value)} /></div>
       <div className="manageTopActions"><button className="secondaryAction" onClick={props.onSave}>Save changes</button><SaveLabel state={props.saveState} /><button onClick={props.onOpenBracket}>Open bracket →</button></div>
     </div>
-    {props.clonedFromId && <button className="manageCloneLineage" onClick={() => props.onOpenOriginal(props.clonedFromId as string)}>Cloned from {props.clonedFromName || "original bracket"} — view original ↗</button>}
+    {props.clonedFromId && <button className="manageCloneLineage" onClick={() => props.onOpenOriginal(props.clonedFromId as string)}>Remixed from {props.clonedFromName || "original bracket"} — view original ↗</button>}
 
     <nav className="manageTabs" aria-label="Manage bracket sections">
       <button className={activeTab === "settings" ? "active" : ""} onClick={() => setActiveTab("settings")}><span>01</span><b>Settings</b><small>Visibility, tags, play and ranking</small></button>
@@ -1535,14 +2152,17 @@ function ManageBracket(props: {
       <div className="regionAdminToolbar">
         <div><small>ORGANIZE YOUR FIELD</small><b>{regionCount === 1 ? "Bracket Entries" : "Regions & Entries"}</b><p>Drag entries to reseed or move them. Lock favorites before randomizing.</p></div>
         <div className="regionAdminTools">
-          {props.size >= 32 && <label className="compactSeedingSelect">
-            <span>Regional seeding</span>
-            <select value={props.seedingStyle} onChange={(event) => props.onSeedingStyle(event.target.value as SeedingStyle)} aria-label="Regional seeding style">
-              <option value="overall">Overall 1–{props.size}</option>
-              <option value="regional">Regional 1–16</option>
-            </select>
-          </label>}
+          {legacyImageCount > 0 && <button className="secondaryAction cacheLegacyButton" disabled={legacyCacheState === "working"} onClick={async () => {
+            setLegacyCacheState("working");
+            setLegacyCacheMessage(`Caching ${legacyImageCount} legacy image${legacyImageCount === 1 ? "" : "s"}…`);
+            const result = await props.onCacheLegacyImages();
+            setLegacyCacheState("idle");
+            if (!result.total) setLegacyCacheMessage("No legacy images need caching.");
+            else if (!result.failed) setLegacyCacheMessage(`Cached ${result.cached} image${result.cached === 1 ? "" : "s"}. Save changes when ready.`);
+            else setLegacyCacheMessage(`Cached ${result.cached} of ${result.total}. ${result.failed} could not be imported.`);
+          }}>{legacyCacheState === "working" ? "Caching images…" : `Cache legacy images (${legacyImageCount})`}</button>}
           <button className="secondaryAction" onClick={props.onRandomizeAll}>↝ Randomize all unlocked</button>
+          {legacyCacheMessage && <small className="legacyCacheMessage">{legacyCacheMessage}</small>}
         </div>
       </div>
 
@@ -1567,7 +2187,7 @@ function ManageBracket(props: {
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={(event) => { event.preventDefault(); if (draggedSeed) props.onSwap(draggedSeed, contestant.seed); setDraggedSeed(null); }}
               >
-                <button className="adminCardMain" onClick={() => props.onSelectSeed(contestant.seed)}>
+                <button className={`adminCardMain ${props.seedingStyle === "seedless" ? "seedlessCard" : ""}`} onClick={() => props.onSelectSeed(contestant.seed)}>
                   <ContestantPhoto contestant={contestant} />
                   {props.seedingStyle !== "seedless" && <span className="adminSeed">{displayedSeed(contestant, props.size, props.seedingStyle)}</span>}
                   <span><b>{contestant.name || (props.seedingStyle === "seedless" ? "Empty entry" : `Seed ${displayedSeed(contestant, props.size, props.seedingStyle)}`)}</b><small>{contestant.details || "Add details and an image"}</small></span>
@@ -1682,6 +2302,22 @@ function ContestantDrawer({ contestant, onClose, onUpdate, onUpload }: {
     }
   }
 
+  async function importCurrentImage() {
+    if (!contestant.imageUrl) return;
+    setImageTask("fetching");
+    try {
+      const blob = await fetchImageBlobForImport(contestant.imageUrl);
+      const pathname = (() => { try { return new URL(contestant.imageUrl).pathname; } catch { return "image"; } })();
+      const label = pathname.split("/").pop() || `${contestant.name || "image"}.jpg`;
+      openCropper(blob, label);
+    } catch (error) {
+      console.error(error);
+      window.alert(error instanceof Error ? error.message : "Could not import the current image.");
+    } finally {
+      setImageTask("");
+    }
+  }
+
   async function captureScreenGrab() {
     if (!navigator.mediaDevices?.getDisplayMedia) {
       window.alert("Screen capture is not available in this browser.");
@@ -1735,6 +2371,7 @@ function ContestantDrawer({ contestant, onClose, onUpdate, onUpload }: {
             <button type="button" onClick={importFromUrl} disabled={imageTask !== ""}>{imageTask === "fetching" ? "Loading…" : "Image URL"}</button>
             <button type="button" onClick={captureScreenGrab} disabled={imageTask !== ""}>{imageTask === "capturing" ? "Capturing…" : "Capture screen"}</button>
           </div>
+          {isLegacyContestantImage(contestant) && <button type="button" className="importCurrentImageButton" onClick={importCurrentImage} disabled={imageTask !== ""}>{imageTask === "fetching" ? "Importing current image…" : "Import current image into FatBrackets"}</button>}
           <small className="imageActionHint">Images are cropped to a square, resized to 640×640 and compressed to WebP.</small>
           <input ref={inputRef} hidden type="file" accept="image/*" onChange={(event) => chooseFile(event.target.files?.[0])} />
         </div>
@@ -1845,6 +2482,54 @@ function ImageCropEditor({ source, onClose, onSave }: {
     </div>
     <div className="asideActions cropActions"><button onClick={onClose}>Cancel</button><button onClick={saveCrop} disabled={saving || !imageSize}>{saving ? "Saving…" : "Use cropped image"}</button></div>
   </aside></>;
+}
+
+function ProfilePage({ profile, email, createdBrackets, favoriteBrackets, recentSubmissions, onSave, onUploadAvatar, onOpen, onRemix }: { profile: UserProfile; email: string; createdBrackets: Tournament[]; favoriteBrackets: Tournament[]; recentSubmissions: Array<BracketSubmission & { tournaments?: Tournament | Tournament[] | null }>; onSave: (profile: UserProfile) => Promise<void>; onUploadAvatar: (source: ImageUploadPayload) => Promise<string | undefined>; onOpen: (item: Tournament) => void; onRemix: (item: Tournament) => void }) {
+  const [draft, setDraft] = useState(profile);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  useEffect(() => setDraft(profile), [profile]);
+  function setField<K extends keyof UserProfile>(key: K, value: UserProfile[K]) { setDraft((current) => ({ ...current, [key]: value })); }
+  async function submit() { setSaving(true); setMessage(""); try { await onSave(draft); setMessage("Profile saved."); } catch (error) { setMessage(error instanceof Error ? error.message : "Could not save profile."); } finally { setSaving(false); } }
+  return <div className="workspace profilePage">
+    <header className="profileHero"><ProfileAvatarEditor profile={draft} onUploaded={(url) => setField("avatar_url", url)} onUpload={onUploadAvatar} /><div><small>YOUR FATBRACKETS PROFILE</small><h1>{draft.display_name || `${draft.first_name} ${draft.last_name}`.trim() || "Build your profile"}</h1><p>{draft.bio || "Tell the community who you are and what kinds of brackets you love."}</p></div><button onClick={submit} disabled={saving}>{saving ? "Saving…" : "Save profile"}</button></header>
+    {message && <p className="profileMessage">{message}</p>}
+    <div className="profileLayout">
+      <section className="profileEditor"><div className="profileSectionHeading"><div><small>ABOUT YOU</small><h2>Profile details</h2></div><span>{email}</span></div>
+        <div className="profileFormGrid"><label>First name<input value={draft.first_name} onChange={(e) => setField("first_name", e.target.value)} /></label><label>Last name<input value={draft.last_name} onChange={(e) => setField("last_name", e.target.value)} /></label><label>Display name<input value={draft.display_name} onChange={(e) => setField("display_name", e.target.value)} placeholder="Shown around FatBrackets" /></label><label>Location<input value={draft.location} onChange={(e) => setField("location", e.target.value)} placeholder="City, state or country" /></label></div>
+        <label>Brief description<textarea rows={4} value={draft.bio} onChange={(e) => setField("bio", e.target.value)} placeholder="Favorite topics, rivalries, bracket philosophy…" /></label>
+      </section>
+      <aside className="profileStats"><article><b>{createdBrackets.length}</b><span>Recent creations</span></article><article><b>{favoriteBrackets.length}</b><span>Favorites</span></article><article><b>{recentSubmissions.length}</b><span>Submitted picks</span></article></aside>
+    </div>
+    <ProfileBracketShelf title="Recently created" empty="Create a bracket and it will appear here." brackets={createdBrackets} onOpen={onOpen} onRemix={onRemix} />
+    <ProfileBracketShelf title="Favorite brackets" empty="Favorite community brackets from Explore to save them here." brackets={favoriteBrackets} onOpen={onOpen} onRemix={onRemix} />
+    <SubmissionShelf submissions={recentSubmissions} onOpen={onOpen} />
+  </div>;
+}
+
+function ProfileAvatarEditor({ profile, onUploaded, onUpload }: { profile: UserProfile; onUploaded: (url: string) => void; onUpload: (source: ImageUploadPayload) => Promise<string | undefined> }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [cropSource, setCropSource] = useState<CropSource | null>(null);
+  const [busy, setBusy] = useState(false);
+  function open(blob: Blob, label: string) { if (!blob.type.startsWith("image/")) return; setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return { blob, label, url: URL.createObjectURL(blob) }; }); }
+  async function paste() { setBusy(true); try { const read = (navigator.clipboard as Clipboard & { read?: () => Promise<ClipboardItem[]> }).read; if (!read) throw new Error("Clipboard image paste is unavailable in this browser."); const items = await read.call(navigator.clipboard); for (const item of items) { const type = item.types.find((value) => value.startsWith("image/")); if (type) { open(await item.getType(type), "profile-paste.png"); return; } } throw new Error("No image was found in the clipboard."); } catch (error) { window.alert(error instanceof Error ? error.message : "Could not paste image."); } finally { setBusy(false); } }
+  async function fromUrl() { const url = window.prompt("Paste an image URL"); if (!url) return; setBusy(true); try { const response = await fetch(url); if (!response.ok) throw new Error("Could not fetch that image."); const blob = await response.blob(); if (!blob.type.startsWith("image/")) throw new Error("That URL did not return an image."); open(blob, "profile-url.png"); } catch (error) { window.alert(error instanceof Error ? error.message : "Could not load image."); } finally { setBusy(false); } }
+  async function capture() { if (!navigator.mediaDevices?.getDisplayMedia) return window.alert("Screen capture is unavailable in this browser."); setBusy(true); let stream: MediaStream | null = null; try { stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false }); const video = document.createElement("video"); video.srcObject = stream; await new Promise<void>((resolve) => { video.onloadedmetadata = () => resolve(); }); await video.play(); const canvas = document.createElement("canvas"); canvas.width = video.videoWidth; canvas.height = video.videoHeight; canvas.getContext("2d")?.drawImage(video, 0, 0); const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Capture failed.")), "image/png")); open(blob, "profile-capture.png"); } catch (error) { if ((error as DOMException)?.name !== "NotAllowedError") window.alert(error instanceof Error ? error.message : "Could not capture screen."); } finally { stream?.getTracks().forEach((track) => track.stop()); setBusy(false); } }
+  return <div className="profileAvatarEditor"><div className="profileHeroAvatar">{profile.avatar_url ? <img src={profile.avatar_url} alt="Profile" /> : initials(profile.display_name || `${profile.first_name} ${profile.last_name}`)}</div><div className="profileAvatarActions"><button onClick={() => inputRef.current?.click()}>Upload</button><button onClick={paste} disabled={busy}>Paste</button><button onClick={fromUrl} disabled={busy}>URL</button><button onClick={capture} disabled={busy}>Capture</button></div><input ref={inputRef} hidden type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) open(file, file.name); event.currentTarget.value = ""; }} />{cropSource && <ImageCropEditor source={cropSource} onClose={() => setCropSource(null)} onSave={async (payload) => { const url = await onUpload(payload); if (url) onUploaded(url); setCropSource(null); }} />}</div>;
+}
+
+function SubmissionShelf({ submissions, onOpen }: { submissions: Array<BracketSubmission & { tournaments?: Tournament | Tournament[] | null }>; onOpen: (item: Tournament) => void }) {
+  const rows = submissions.map((item) => ({ item, bracket: Array.isArray(item.tournaments) ? item.tournaments[0] : item.tournaments })).filter((row) => row.bracket) as Array<{ item: BracketSubmission; bracket: Tournament }>;
+  return <section className="profileShelf"><div className="profileSectionHeading"><div><small>ACTIVITY</small><h2>Recently filled out</h2></div></div>{rows.length ? <div className="profileBracketGrid">{rows.map(({ item, bracket }) => <article key={item.id || bracket.id}><div className="profileMiniBracket"><span/><span/><span/></div><div><small>Submitted {new Date(item.submitted_at).toLocaleDateString()}</small><h3>{bracket.name}</h3><p>Champion selected</p></div><div className="profileBracketActions"><button onClick={() => onOpen(bracket)}>Open</button></div></article>)}</div> : <p className="profileEmpty">Fill out a community bracket and it will appear here.</p>}</section>;
+}
+
+function PublicProfilePage({ profile, brackets, onOpen, onRemix }: { profile: UserProfile; brackets: Tournament[]; onOpen: (item: Tournament) => void; onRemix: (item: Tournament) => void }) {
+  const name = profile.display_name || [profile.first_name, profile.last_name].filter(Boolean).join(" ") || "FatBrackets user";
+  return <div className="workspace profilePage publicProfilePage"><header className="profileHero"><div className="profileHeroAvatar">{profile.avatar_url ? <img src={profile.avatar_url} alt={name} /> : initials(name)}</div><div><small>FATBRACKETS CREATOR</small><h1>{name}</h1><p>{profile.bio || "This creator has not added a description yet."}</p>{profile.location && <span className="profileLocation">⌖ {profile.location}</span>}</div></header><ProfileBracketShelf title="Public brackets" empty="This creator has no public brackets yet." brackets={brackets} onOpen={onOpen} onRemix={onRemix} /></div>;
+}
+
+function ProfileBracketShelf({ title, empty, brackets, onOpen, onRemix }: { title: string; empty: string; brackets: Tournament[]; onOpen: (item: Tournament) => void; onRemix: (item: Tournament) => void }) {
+  return <section className="profileShelf"><div className="profileSectionHeading"><div><small>ACTIVITY</small><h2>{title}</h2></div></div>{brackets.length ? <div className="profileBracketGrid">{brackets.map((item) => <article key={item.id}><div className="profileMiniBracket"><span/><span/><span/></div><div><small>{item.bracket_size} entries</small><h3>{item.name}</h3><p>{(item.tags || []).slice(0,3).join(" · ")}</p></div><div className="profileBracketActions"><button onClick={() => onOpen(item)}>Open</button><button onClick={() => onRemix(item)}>Remix</button></div></article>)}</div> : <p className="profileEmpty">{empty}</p>}</section>;
 }
 
 function AdminSettings({ settings, onChange, onReset }: {
@@ -2027,10 +2712,10 @@ function SettingSlider({ label, help, value, min, max, step, display, onChange }
   return <label className="settingRow"><div><b>{label}</b><small>{help}</small></div><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /><output>{display}</output></label>;
 }
 
-function Bracket({ tournamentId, contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, theme, editable, participants, onSave, onClear, onEdit, onWinner }: {
-  tournamentId: string | null; contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; theme: BracketTheme; editable: boolean;
+function Bracket({ tournamentId, slug, contestants, name, saveState, size, winners, regionNames, seedingStyle, settings, theme, editable, participants, onSave, onClear, onEdit, onWinner, isOwner, fillMode, submissionState, onBeginFill, onExitFill, ownerProfile, onOpenOwnerProfile }: {
+  tournamentId: string | null; slug: string; contestants: Contestant[]; name: string; saveState: SaveState; size: number; winners: WinnerMap; regionNames: string[]; seedingStyle: SeedingStyle; settings: AppSettings; theme: BracketTheme; editable: boolean;
   participants: (round: number, match: number) => Array<Contestant | null>; onSave: () => void; onClear: () => void; onEdit: () => void;
-  onWinner: (round: number, match: number, contestant: Contestant) => void;
+  onWinner: (round: number, match: number, contestant: Contestant) => void; isOwner: boolean; fillMode: boolean; submissionState: SaveState; onBeginFill: () => void; onExitFill: () => void; ownerProfile: UserProfile | null; onOpenOwnerProfile: () => void;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef({
@@ -2062,6 +2747,7 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
   const [scale, setScale] = useState(settings.defaultZoom);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [selectedRegion, setSelectedRegion] = useState("full");
+  const [shareOpen, setShareOpen] = useState(false);
   const [nextMatchupMode, setNextMatchupMode] = useState(() => {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(nextMatchupModeKey) === "true";
@@ -2587,13 +3273,15 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
     <div className="bracketHeading canvasHeading">
       <div className="canvasTitle">
         <h1>{name}</h1>
-        <p>Drag to move. Scroll or pinch to zoom. Double-click or double-tap to zoom toward that point.</p>
+        <div className="bracketByline"><p>Drag to move. Scroll or pinch to zoom. Double-click or double-tap to zoom toward that point.</p>{ownerProfile && <button className="ownerProfileLink" onClick={onOpenOwnerProfile}>by {ownerProfile.display_name || [ownerProfile.first_name, ownerProfile.last_name].filter(Boolean).join(" ") || "creator"}</button>}</div>
       </div>
       <div className="canvasActions">
-        {!editable && <span className="readOnlyBadge">View only</span>}
-        {editable && <button className="compactAction clearBracketAction" onClick={onClear}>Clear</button>}
-        {editable && <button className="compactAction darkSecondary" onClick={onEdit}>Edit bracket</button>}
-        {editable && <div className="saveActionGroup"><button className="compactAction primaryAction" onClick={onSave}>Save bracket</button><SaveLabel state={saveState} /></div>}
+        {!isOwner && !fillMode && <><span className="readOnlyBadge">View only</span><button className="compactAction primaryAction" onClick={onBeginFill}>Fill out bracket</button></>}
+        {fillMode && <><button className="compactAction clearBracketAction" onClick={onClear}>Clear picks</button><button className="compactAction darkSecondary" onClick={onExitFill}>Exit picks</button><div className="saveActionGroup"><button className="compactAction primaryAction" onClick={onSave}>Submit picks</button><SaveLabel state={submissionState} /></div></>}
+        <button className="compactAction shareBracketAction" onClick={() => setShareOpen(true)}>{fillMode ? "Share picks" : "Share"}</button>
+        {isOwner && <button className="compactAction clearBracketAction" onClick={onClear}>Clear</button>}
+        {isOwner && <button className="compactAction darkSecondary" onClick={onEdit}>Edit bracket</button>}
+        {isOwner && <div className="saveActionGroup"><button className="compactAction primaryAction" onClick={onSave}>Save bracket</button><SaveLabel state={saveState} /></div>}
       </div>
     </div>
     <div
@@ -2716,14 +3404,102 @@ function Bracket({ tournamentId, contestants, name, saveState, size, winners, re
         <ChampionCard seedLabel={(item) => seedingStyle === "seedless" ? null : displayedSeed(item, size, seedingStyle)} contestant={champion} left={centerX - 170} top={centerY - 82} winnerMark={theme.winnerMark} />
       </div>
     </div>
+    {shareOpen && <BracketShareModal
+      name={name}
+      creator={ownerProfile?.display_name || [ownerProfile?.first_name, ownerProfile?.last_name].filter(Boolean).join(" ") || "FatBrackets user"}
+      slug={slug}
+      tournamentId={tournamentId}
+      contestants={contestants}
+      winners={winners}
+      size={size}
+      theme={theme}
+      seedingStyle={seedingStyle}
+      initialLayout={size > 32 ? "spotlight" : "bracket"}
+      onClose={() => setShareOpen(false)}
+    />}
   </div>;
+}
+
+function BracketShareModal({ name, creator, slug, tournamentId, contestants, winners, size, theme, seedingStyle, initialLayout, onClose }: {
+  name: string; creator: string; slug: string; tournamentId: string | null; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; seedingStyle: SeedingStyle; initialLayout: ShareLayout; onClose: () => void;
+}) {
+  const savedPrefs = (() => { try { return JSON.parse(window.localStorage.getItem("fatbrackets:share-preferences") || "{}"); } catch { return {}; } })() as Partial<{ layout: ShareLayout; format: ShareFormat; showImages: boolean; showSeeds: boolean; showCreator: boolean }>;
+  const [layout, setLayout] = useState<ShareLayout>(savedPrefs.layout || initialLayout);
+  const [format, setFormat] = useState<ShareFormat>(savedPrefs.format || "social");
+  const [showImages, setShowImages] = useState(savedPrefs.showImages ?? true);
+  const [showSeeds, setShowSeeds] = useState(savedPrefs.showSeeds ?? (seedingStyle !== "seedless"));
+  const [showCreator, setShowCreator] = useState(savedPrefs.showCreator ?? true);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [blob, setBlob] = useState<Blob | null>(null);
+  const [working, setWorking] = useState(false);
+  const [message, setMessage] = useState("");
+  const link = shareUrl(slug, tournamentId);
+
+  const regenerate = useCallback(async () => {
+    setWorking(true); setMessage("");
+    try {
+      const next = await createBracketShareImage({ name, creator, contestants, winners, size, theme, layout, format, showImages, showSeeds, showCreator, seedingStyle });
+      setBlob(next);
+      setPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return URL.createObjectURL(next); });
+    } catch (error) {
+      console.error(error); setMessage(error instanceof Error ? error.message : "Could not create share image.");
+    } finally { setWorking(false); }
+  }, [name, creator, contestants, winners, size, theme, layout, format, showImages, showSeeds, showCreator, seedingStyle]);
+
+  useEffect(() => { regenerate(); }, [regenerate]);
+  useEffect(() => {
+    window.localStorage.setItem("fatbrackets:share-preferences", JSON.stringify({ layout, format, showImages, showSeeds, showCreator }));
+  }, [layout, format, showImages, showSeeds, showCreator]);
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
+
+  async function nativeShare() {
+    try {
+      const file = blob ? new File([blob], `${(slug || "fatbrackets").replace(/[^a-z0-9-]+/gi,"-")}.png`, { type: "image/png" }) : null;
+      if (navigator.share) {
+        const shareData: ShareData = { title: name, text: `Check out ${name} on FatBrackets`, url: link };
+        if (file && navigator.canShare?.({ files: [file] })) shareData.files = [file];
+        await navigator.share(shareData); return;
+      }
+      await navigator.clipboard.writeText(link); setMessage("Link copied.");
+    } catch (error) { if ((error as DOMException)?.name !== "AbortError") setMessage("Could not open the share menu."); }
+  }
+
+  async function copyLink() { await navigator.clipboard.writeText(link); setMessage("Link copied."); }
+  async function copyImage() {
+    if (!blob || typeof ClipboardItem === "undefined") return setMessage("Image copy is not supported in this browser.");
+    try { await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]); setMessage("Image copied."); }
+    catch { setMessage("Could not copy the image. Try Download Image instead."); }
+  }
+  function downloadImage() {
+    if (!blob) return; const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=`${(slug || name || "fatbrackets").replace(/[^a-z0-9-]+/gi,"-")}-${format}.png`; a.click(); window.setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }
+
+  return <><button className="scrim shareScrim" aria-label="Close share dialog" onClick={onClose} /><aside className="shareBracketModal">
+    <div className="shareModalHeader"><div><small>SHARE BRACKET</small><h2>{name}</h2><p>Create a social image and link straight back to this bracket.</p></div><button className="shareClose" onClick={onClose}>×</button></div>
+    <div className="shareModalBody">
+      <div className={`sharePreview ${format}`}>{working && <span className="sharePreviewLoading">Building preview…</span>}{previewUrl && <img src={previewUrl} alt={`Share preview for ${name}`} />}</div>
+      <div className="shareControls">
+        <div><small>LAYOUT</small><div className="shareSegment"><button className={layout === "bracket" ? "active" : ""} onClick={() => setLayout("bracket")}>Bracket</button><button className={layout === "spotlight" ? "active" : ""} onClick={() => setLayout("spotlight")}>Spotlight</button></div></div>
+        <div><small>FORMAT</small><div className="shareSegment"><button className={format === "social" ? "active" : ""} onClick={() => setFormat("social")}>Social 1200×630</button><button className={format === "square" ? "active" : ""} onClick={() => setFormat("square")}>Square 1080</button></div></div>
+        <div className="shareToggleGrid">
+          <label className="shareCheck"><input type="checkbox" checked={showImages} onChange={(event) => setShowImages(event.target.checked)} /> Show entry images</label>
+          {seedingStyle !== "seedless" && <label className="shareCheck"><input type="checkbox" checked={showSeeds} onChange={(event) => setShowSeeds(event.target.checked)} /> Show seeds</label>}
+          <label className="shareCheck"><input type="checkbox" checked={showCreator} onChange={(event) => setShowCreator(event.target.checked)} /> Show creator</label>
+        </div>
+        <button className="shareFullSize" onClick={() => { if (previewUrl) window.open(previewUrl, "_blank", "noopener,noreferrer"); }} disabled={!previewUrl}>Open full-size preview</button>
+        <div className="shareActionStack"><button className="sharePrimary" onClick={nativeShare} disabled={working}>Share…</button><button onClick={copyLink}>Copy Link</button><button onClick={copyImage} disabled={!blob}>Copy Image</button><button onClick={downloadImage} disabled={!blob}>Download Image</button></div>
+        <div className="shareLinkPreview"><small>PUBLIC LINK</small><code>{link}</code></div>
+        {message && <p className="shareMessage">{message}</p>}
+      </div>
+    </div>
+  </aside></>;
 }
 
 function MatchupCard({ options, winnerId, seedLabel, editable, onWinner, top, width }: {
   options: Array<Contestant | null>; winnerId?: string; seedLabel: (item: Contestant) => number | null; editable: boolean; onWinner: (item: Contestant) => void; top: number; width: number;
 }) {
   return <div className="canvasMatchup" style={{ top, width }}>
-    {options.map((item, slot) => item ? <button disabled={!editable} className={`${winnerId === item.id ? "winner" : ""} ${!editable ? "readOnly" : ""}`} key={item.id ?? item.seed} onClick={() => editable && onWinner(item)}>
+    {options.map((item, slot) => item ? <button disabled={!editable} className={`${winnerId === item.id ? "winner" : ""} ${!editable ? "readOnly" : ""} ${seedLabel(item) === null ? "seedlessCard" : ""}`} key={item.id ?? item.seed} onClick={() => editable && onWinner(item)}>
       <ContestantPhoto contestant={item} />
       {seedLabel(item) !== null && <span className="seedBadge">{seedLabel(item)}</span>}
       <span className="contestantCopy"><b>{item.shortName || item.name}</b><small>{item.details || (editable ? "Click to advance" : "View contestant")}</small></span>
@@ -2733,7 +3509,7 @@ function MatchupCard({ options, winnerId, seedLabel, editable, onWinner, top, wi
 }
 
 function FinalistCard({ contestant, selected, seedLabel, editable, onClick }: { contestant: Contestant | null; selected: boolean; seedLabel: (item: Contestant) => number | null; editable: boolean; onClick: () => void }) {
-  return contestant ? <button disabled={!editable} className={`finalistCard ${selected ? "winner" : ""} ${!editable ? "readOnly" : ""}`} onClick={() => editable && onClick()}>
+  return contestant ? <button disabled={!editable} className={`finalistCard ${selected ? "winner" : ""} ${!editable ? "readOnly" : ""} ${seedLabel(contestant) === null ? "seedlessCard" : ""}`} onClick={() => editable && onClick()}>
     <ContestantPhoto contestant={contestant} />
     {seedLabel(contestant) !== null && <span className="seedBadge">{seedLabel(contestant)}</span>}
     <span className="contestantCopy"><b>{contestant.name}</b><small>{contestant.details || "Choose as champion"}</small></span>

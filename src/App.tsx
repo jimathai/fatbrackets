@@ -360,7 +360,7 @@ function roundedRect(context: CanvasRenderingContext2D, x: number, y: number, wi
 }
 
 async function createBracketShareImage(options: {
-  name: string; creator: string; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; layout: ShareLayout; format: ShareFormat; showImages: boolean; showSeeds: boolean; showCreator: boolean; seedingStyle: SeedingStyle;
+  name: string; creator: string; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; layout: ShareLayout; format: ShareFormat; showImages: boolean;
 }) {
   const { width, height } = shareDimensions(options.format);
   const canvas = document.createElement("canvas");
@@ -377,10 +377,8 @@ async function createBracketShareImage(options: {
 
   ctx.fillStyle = "#f6f8fb"; ctx.font = `800 ${options.format === "square" ? 48 : 40}px Arial, sans-serif`;
   ctx.fillText(options.name || "FatBrackets", 48, 64);
-  if (options.showCreator) {
-    ctx.fillStyle = "#aebbd0"; ctx.font = "600 18px Arial, sans-serif";
-    ctx.fillText(options.creator ? `by ${options.creator}` : "FatBrackets", 50, 92);
-  }
+  ctx.fillStyle = "#aebbd0"; ctx.font = "600 18px Arial, sans-serif";
+  ctx.fillText(options.creator ? `by ${options.creator}` : "FatBrackets", 50, 92);
   ctx.textAlign = "right"; ctx.fillStyle = "#ef4444"; ctx.font = "900 22px Arial, sans-serif"; ctx.fillText("FATBRACKETS", width - 48, 62); ctx.textAlign = "left";
 
   const filled = options.contestants.filter((entry) => entry.name.trim()).sort((a,b) => a.seed-b.seed);
@@ -400,62 +398,16 @@ async function createBracketShareImage(options: {
       const d = Math.min(h - 8, 42); ctx.save(); roundedRect(ctx, x + 6, y + 4, d, d, options.theme.imageShape === "circle" ? d/2 : options.theme.imageShape === "square" ? 0 : 8); ctx.clip();
       const s = Math.min(img.naturalWidth, img.naturalHeight); ctx.drawImage(img, (img.naturalWidth-s)/2, (img.naturalHeight-s)/2, s, s, x+6, y+4, d, d); ctx.restore(); textX = x + d + 14;
     }
-    const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)}  ` : "";
     ctx.fillStyle = "#f8fafc"; ctx.font = `800 ${Math.max(10, Math.min(18, h*.34))}px Arial, sans-serif`;
-    const rawLabel = `${seedText}${entry.name}`;
-    const maxChars = Math.max(9, Math.floor((w-(textX-x)-12)/8)); const label = rawLabel.length > maxChars ? rawLabel.slice(0,maxChars-1)+"…" : rawLabel; ctx.fillText(label, textX, y + h*.58);
+    const maxChars = Math.max(9, Math.floor((w-(textX-x)-12)/8)); const label = entry.name.length > maxChars ? entry.name.slice(0,maxChars-1)+"…" : entry.name; ctx.fillText(label, textX, y + h*.58);
   };
 
   if (options.layout === "spotlight") {
-    const hero = champion || filled[0] || null;
-    const featured = filled.filter((entry) => entry.id !== hero?.id).slice(0, options.format === "square" ? 6 : 4);
-    const heroX = options.format === "square" ? 70 : 64;
-    const heroY = options.format === "square" ? 170 : 150;
-    const heroW = options.format === "square" ? width - 140 : 430;
-    const heroH = options.format === "square" ? 360 : 340;
-
-    ctx.fillStyle = "rgba(255,255,255,.035)";
-    roundedRect(ctx, heroX, heroY, heroW, heroH, 26); ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,.12)"; ctx.lineWidth = 1; ctx.stroke();
-
-    if (hero) {
-      const heroImg = hero.imageUrl ? imageCache.get(hero.imageUrl) : null;
-      if (options.showImages && heroImg) {
-        const imageSize = options.format === "square" ? 230 : 215;
-        const imageX = heroX + (heroW - imageSize) / 2;
-        const imageY = heroY + 28;
-        ctx.save(); roundedRect(ctx, imageX, imageY, imageSize, imageSize, options.theme.imageShape === "circle" ? imageSize / 2 : 24); ctx.clip();
-        const s = Math.min(heroImg.naturalWidth, heroImg.naturalHeight);
-        ctx.drawImage(heroImg, (heroImg.naturalWidth-s)/2, (heroImg.naturalHeight-s)/2, s, s, imageX, imageY, imageSize, imageSize); ctx.restore();
-      }
-      ctx.textAlign = "center";
-      ctx.fillStyle = options.theme.winnerMarkColor || "#ef4444";
-      ctx.font = `900 ${options.format === "square" ? 18 : 16}px Arial, sans-serif`;
-      ctx.fillText(champion ? "CURRENT CHAMPION" : "FEATURED ENTRY", heroX + heroW / 2, heroY + heroH - 82);
-      ctx.fillStyle = "#fff";
-      ctx.font = `900 ${options.format === "square" ? 36 : 32}px Arial, sans-serif`;
-      ctx.fillText(hero.name, heroX + heroW / 2, heroY + heroH - 42);
-      ctx.textAlign = "left";
-    }
-
-    const listX = options.format === "square" ? 70 : 535;
-    const listY = options.format === "square" ? 560 : 150;
-    const listW = options.format === "square" ? width - 140 : width - listX - 64;
-    const listCardH = options.format === "square" ? 76 : 72;
-    const listGap = options.format === "square" ? 12 : 14;
-    const cols = options.format === "square" ? 2 : 1;
-    const colGap = 14;
-    const cardW = cols === 1 ? listW : (listW - colGap) / 2;
-    featured.forEach((entry, index) => {
-      const col = index % cols; const row = Math.floor(index / cols);
-      drawEntry(entry, listX + col * (cardW + colGap), listY + row * (listCardH + listGap), cardW, listCardH, entry.id === championId);
-    });
-
-    ctx.fillStyle = "#f8fafc"; ctx.font = `900 ${options.format === "square" ? 31 : 26}px Arial, sans-serif`;
-    const promoY = options.format === "square" ? height - 125 : height - 94;
-    ctx.fillText(`${filled.length} entries. One bracket.`, options.format === "square" ? 70 : 535, promoY);
-    ctx.fillStyle = "#aebbd0"; ctx.font = `700 ${options.format === "square" ? 18 : 16}px Arial, sans-serif`;
-    ctx.fillText("Fill it out, remix it, and share your picks on FatBrackets.", options.format === "square" ? 70 : 535, promoY + 30);
+    const picks = filled.slice(0, 8);
+    const cardW = options.format === "square" ? 450 : 250; const cardH = options.format === "square" ? 104 : 88;
+    const cols = options.format === "square" ? 2 : 4; const gap = 18; const startY = options.format === "square" ? 190 : 165;
+    picks.forEach((entry, index) => { const col=index%cols,row=Math.floor(index/cols); const total=cols*cardW+(cols-1)*gap; const x=(width-total)/2+col*(cardW+gap); drawEntry(entry,x,startY+row*(cardH+18),cardW,cardH,entry.id===championId); });
+    if (champion) { ctx.textAlign="center"; ctx.fillStyle="#fff"; ctx.font=`900 ${options.format === "square" ? 42 : 32}px Arial, sans-serif`; ctx.fillText(`Champion: ${champion.name}`,width/2,height-(options.format === "square" ? 150 : 96)); ctx.textAlign="left"; }
   } else {
     const contestantById = new Map(options.contestants.filter((entry) => entry.id).map((entry) => [entry.id as string, entry]));
     const rounds = Math.log2(options.size);
@@ -568,9 +520,7 @@ async function createBracketShareImage(options: {
         ctx.font = `800 ${fontSize}px Arial, sans-serif`;
         const room = cardWidth - (textX - x) - 7;
         const chars = Math.max(5, Math.floor(room / Math.max(5, fontSize * .58)));
-        const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)} ` : "";
-        const rawLabel = `${seedText}${entry.name}`;
-        const label = rawLabel.length > chars ? rawLabel.slice(0, Math.max(1, chars - 1)) + "…" : rawLabel;
+        const label = entry.name.length > chars ? entry.name.slice(0, Math.max(1, chars - 1)) + "…" : entry.name;
         ctx.fillText(label, textX, rowTop + rowHeight * .63);
       });
     };
@@ -628,9 +578,7 @@ async function createBracketShareImage(options: {
       if (entry.id === finalWinnerId) { ctx.fillStyle = options.theme.selectedCardBackground || "#7f1d1d"; ctx.fillRect(finalX + 1, y + 1, finalWidth - 2, finalRow - 2); }
       ctx.fillStyle = "#fff"; ctx.font = `800 ${Math.max(9, Math.min(13, finalRow * .34))}px Arial, sans-serif`;
       const maxChars = Math.max(7, Math.floor((finalWidth - 16) / 7.2));
-      const seedText = options.showSeeds && options.seedingStyle !== "seedless" ? `${displayedSeed(entry, options.size, options.seedingStyle)} ` : "";
-      const rawLabel = `${seedText}${entry.name}`;
-      const label = rawLabel.length > maxChars ? rawLabel.slice(0, maxChars - 1) + "…" : rawLabel;
+      const label = entry.name.length > maxChars ? entry.name.slice(0, maxChars - 1) + "…" : entry.name;
       ctx.fillText(label, finalX + 8, y + finalRow * .62);
     });
 
@@ -1539,6 +1487,7 @@ export default function Home() {
           onSearch={setSearch}
           onSelectSeed={setSelectedSeed}
           onUpdateContestant={updateContestant}
+          onUploadImage={uploadContestantImage}
         />
       )}
 
@@ -1756,6 +1705,7 @@ function Builder(props: {
   onRegionNames: (names: string[]) => void; onPlayMode: (mode: PlayMode) => void; onTags: (tags: string[]) => void; onVisibility: (visibility: "private" | "public") => void; onSave: () => void;
   onSearch: (value: string) => void; onSelectSeed: (seed: number | null) => void;
   onUpdateContestant: (seed: number, patch: Partial<Contestant>) => void;
+  onUploadImage: (seed: number, source: ImageUploadPayload) => void | Promise<void>;
 }) {
   const [entryMethod, setEntryMethod] = useState<EntryMethod>("manual");
   const [pastedList, setPastedList] = useState("");
@@ -1940,7 +1890,7 @@ function Builder(props: {
         </section>
       </div>
     </div>
-    {selected && <ContestantDrawer contestant={selected} onClose={() => props.onSelectSeed(null)} onUpdate={props.onUpdateContestant} />}
+    {selected && <ContestantDrawer contestant={selected} onClose={() => props.onSelectSeed(null)} onUpdate={props.onUpdateContestant} onUpload={props.onUploadImage} />}
   </>;
 }
 
@@ -2208,7 +2158,7 @@ type CropSource = { blob: Blob; url: string; label: string };
 
 function ContestantDrawer({ contestant, onClose, onUpdate, onUpload }: {
   contestant: Contestant; onClose: () => void; onUpdate: (seed: number, patch: Partial<Contestant>) => void;
-  onUpload?: (seed: number, source: ImageUploadPayload) => void | Promise<void>;
+  onUpload: (seed: number, source: ImageUploadPayload) => void | Promise<void>;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [libraryImages, setLibraryImages] = useState<Array<{ id: string; label: string; public_url: string; usage_count: number }>>([]);
@@ -2388,7 +2338,7 @@ function ContestantDrawer({ contestant, onClose, onUpdate, onUpload }: {
     <div className="preview"><small>CARD PREVIEW</small><Player contestant={contestant} /></div>
     <div className="asideActions"><button onClick={() => onUpdate(contestant.seed, { name: "", shortName: "", details: "", imageUrl: "", imageAssetId: null })}>Clear seed</button><button onClick={onClose}>Done</button></div>
   </aside>
-  {cropSource && <ImageCropEditor source={cropSource} onClose={() => setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; })} onSave={async (payload) => { await onUpload?.(contestant.seed, payload); setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; }); }} />}
+  {cropSource && <ImageCropEditor source={cropSource} onClose={() => setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; })} onSave={async (payload) => { await onUpload(contestant.seed, payload); setCropSource((current) => { if (current) URL.revokeObjectURL(current.url); return null; }); }} />}
   </>;
 }
 
@@ -3413,22 +3363,18 @@ function Bracket({ tournamentId, slug, contestants, name, saveState, size, winne
       winners={winners}
       size={size}
       theme={theme}
-      seedingStyle={seedingStyle}
       initialLayout={size > 32 ? "spotlight" : "bracket"}
       onClose={() => setShareOpen(false)}
     />}
   </div>;
 }
 
-function BracketShareModal({ name, creator, slug, tournamentId, contestants, winners, size, theme, seedingStyle, initialLayout, onClose }: {
-  name: string; creator: string; slug: string; tournamentId: string | null; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; seedingStyle: SeedingStyle; initialLayout: ShareLayout; onClose: () => void;
+function BracketShareModal({ name, creator, slug, tournamentId, contestants, winners, size, theme, initialLayout, onClose }: {
+  name: string; creator: string; slug: string; tournamentId: string | null; contestants: Contestant[]; winners: WinnerMap; size: number; theme: BracketTheme; initialLayout: ShareLayout; onClose: () => void;
 }) {
-  const savedPrefs = (() => { try { return JSON.parse(window.localStorage.getItem("fatbrackets:share-preferences") || "{}"); } catch { return {}; } })() as Partial<{ layout: ShareLayout; format: ShareFormat; showImages: boolean; showSeeds: boolean; showCreator: boolean }>;
-  const [layout, setLayout] = useState<ShareLayout>(savedPrefs.layout || initialLayout);
-  const [format, setFormat] = useState<ShareFormat>(savedPrefs.format || "social");
-  const [showImages, setShowImages] = useState(savedPrefs.showImages ?? true);
-  const [showSeeds, setShowSeeds] = useState(savedPrefs.showSeeds ?? (seedingStyle !== "seedless"));
-  const [showCreator, setShowCreator] = useState(savedPrefs.showCreator ?? true);
+  const [layout, setLayout] = useState<ShareLayout>(initialLayout);
+  const [format, setFormat] = useState<ShareFormat>("social");
+  const [showImages, setShowImages] = useState(true);
   const [previewUrl, setPreviewUrl] = useState("");
   const [blob, setBlob] = useState<Blob | null>(null);
   const [working, setWorking] = useState(false);
@@ -3438,18 +3384,15 @@ function BracketShareModal({ name, creator, slug, tournamentId, contestants, win
   const regenerate = useCallback(async () => {
     setWorking(true); setMessage("");
     try {
-      const next = await createBracketShareImage({ name, creator, contestants, winners, size, theme, layout, format, showImages, showSeeds, showCreator, seedingStyle });
+      const next = await createBracketShareImage({ name, creator, contestants, winners, size, theme, layout, format, showImages });
       setBlob(next);
       setPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return URL.createObjectURL(next); });
     } catch (error) {
       console.error(error); setMessage(error instanceof Error ? error.message : "Could not create share image.");
     } finally { setWorking(false); }
-  }, [name, creator, contestants, winners, size, theme, layout, format, showImages, showSeeds, showCreator, seedingStyle]);
+  }, [name, creator, contestants, winners, size, theme, layout, format, showImages]);
 
   useEffect(() => { regenerate(); }, [regenerate]);
-  useEffect(() => {
-    window.localStorage.setItem("fatbrackets:share-preferences", JSON.stringify({ layout, format, showImages, showSeeds, showCreator }));
-  }, [layout, format, showImages, showSeeds, showCreator]);
   useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
 
   async function nativeShare() {
@@ -3481,12 +3424,7 @@ function BracketShareModal({ name, creator, slug, tournamentId, contestants, win
       <div className="shareControls">
         <div><small>LAYOUT</small><div className="shareSegment"><button className={layout === "bracket" ? "active" : ""} onClick={() => setLayout("bracket")}>Bracket</button><button className={layout === "spotlight" ? "active" : ""} onClick={() => setLayout("spotlight")}>Spotlight</button></div></div>
         <div><small>FORMAT</small><div className="shareSegment"><button className={format === "social" ? "active" : ""} onClick={() => setFormat("social")}>Social 1200×630</button><button className={format === "square" ? "active" : ""} onClick={() => setFormat("square")}>Square 1080</button></div></div>
-        <div className="shareToggleGrid">
-          <label className="shareCheck"><input type="checkbox" checked={showImages} onChange={(event) => setShowImages(event.target.checked)} /> Show entry images</label>
-          {seedingStyle !== "seedless" && <label className="shareCheck"><input type="checkbox" checked={showSeeds} onChange={(event) => setShowSeeds(event.target.checked)} /> Show seeds</label>}
-          <label className="shareCheck"><input type="checkbox" checked={showCreator} onChange={(event) => setShowCreator(event.target.checked)} /> Show creator</label>
-        </div>
-        <button className="shareFullSize" onClick={() => { if (previewUrl) window.open(previewUrl, "_blank", "noopener,noreferrer"); }} disabled={!previewUrl}>Open full-size preview</button>
+        <label className="shareCheck"><input type="checkbox" checked={showImages} onChange={(event) => setShowImages(event.target.checked)} /> Show entry images</label>
         <div className="shareActionStack"><button className="sharePrimary" onClick={nativeShare} disabled={working}>Share…</button><button onClick={copyLink}>Copy Link</button><button onClick={copyImage} disabled={!blob}>Copy Image</button><button onClick={downloadImage} disabled={!blob}>Download Image</button></div>
         <div className="shareLinkPreview"><small>PUBLIC LINK</small><code>{link}</code></div>
         {message && <p className="shareMessage">{message}</p>}
